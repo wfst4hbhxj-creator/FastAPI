@@ -12,7 +12,7 @@ pydantic==2.10.4
 vnstock==4.0.4
 
 # --- DNSE OpenAPI (Market Data) ---
-openapi-sdk
+dnse-sdk
 
 # --- Core Dependencies ---
 # Unpinned pandas so pip uses the latest pre-compiled wheel (avoids building from source)
