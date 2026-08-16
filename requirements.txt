@@ -1,6 +1,20 @@
-fastapi
-uvicorn
-httpx
-pydantic
-pydantic-settings
-async-lru
+# ======================================
+# VNStock API v4.2 — Requirements
+# Deploy: Render / Railway / VPS
+# ======================================
+
+# --- Web Framework ---
+fastapi==0.115.6
+uvicorn[standard]==0.32.1
+pydantic==2.10.4
+
+# --- VNStock v4 ---
+vnstock==4.0.4
+
+# --- DNSE OpenAPI (Market Data) ---
+openapi-sdk
+
+# --- Core Dependencies ---
+# Unpinned pandas so pip uses the latest pre-compiled wheel (avoids building from source)
+pandas
+importlib-metadata==8.5.0

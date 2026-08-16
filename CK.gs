@@ -4,7 +4,6 @@
 const TELEGRAM_TOKEN   = '8545515587:AAF6uC6kvliAgGrP3gSuTDtc3XxPJMjZXDg';
 const TELEGRAM_URL     = "https://api.telegram.org/bot" + TELEGRAM_TOKEN;
 const ADMIN_CHAT_ID    = '1538608902';
-const OPENROUTER_API_KEY = 'PASTE_OPENROUTER_KEY_HERE';
 
 // =====================================
 // 🌐 API BASE — V4
@@ -12,36 +11,41 @@ const OPENROUTER_API_KEY = 'PASTE_OPENROUTER_KEY_HERE';
 const API_BASE = "https://vnstockapi.containers.snapdeploy.app";
 
 // =====================================
-// 🤖 GỌI AI — OPENROUTER
+// 🤖 GỌI AI — DeepSeek qua ds2api (OpenAI-compatible)
+// ds2api TỰ ĐỘNG xoay vòng/fallback giữa các tài khoản DeepSeek đã cấu hình
+// sẵn trong config.json của ds2api — bot KHÔNG cần tự viết logic fallback.
 // =====================================
+const DS2API_BASE_URL = 'PASTE_DS2API_BASE_URL';
+const DS2API_KEY      = 'PASTE_DS2API_KEY';
+// Model non-thinking để tránh trễ phản hồi webhook GAS. Đổi sang
+// "deepseek-v4-flash-nothinking" nếu muốn tắt search.
+const DS2API_MODEL    = 'deepseek-v4-flash-search-nothinking';
+
 function callAI(promptText) {
-  if (!OPENROUTER_API_KEY || OPENROUTER_API_KEY.startsWith('PASTE_')) return null;
+  if (!DS2API_KEY || DS2API_KEY.startsWith('PASTE_')) return null;
+  if (!DS2API_BASE_URL || DS2API_BASE_URL.startsWith('PASTE_')) return null;
   try {
-    const res = UrlFetchApp.fetch("https://openrouter.ai/api/v1/chat/completions", {
-      method: "post",
-      headers: {
-        "Authorization": "Bearer " + OPENROUTER_API_KEY,
-        "Content-Type": "application/json"
-      },
+    const res = UrlFetchApp.fetch(DS2API_BASE_URL + "/v1/chat/completions", {
+      method:"post",
+      contentType:"application/json",
+      headers:{"Authorization":"Bearer "+DS2API_KEY},
       payload: JSON.stringify({
-        model: "nvidia/nemotron-3-nano-30b-a3b:free",
-        messages: [
-          { role: "system", content: "Bạn là chuyên gia phân tích chứng khoán Việt Nam. Trả lời bằng tiếng Việt CÓ DẤU. KHÔNG chèn link. Ngắn gọn." },
-          { role: "user", content: promptText }
+        model: DS2API_MODEL,
+        messages:[
+          {role:"system",content:"Bạn là chuyên gia phân tích chứng khoán Việt Nam. Trả lời bằng tiếng Việt CÓ DẤU. KHÔNG chèn link. Ngắn gọn."},
+          {role:"user",content:promptText}
         ],
-        temperature: 0.1,
-        max_tokens: 1500
+        temperature:0.1, max_tokens:1500, stream:false
       }),
-      muteHttpExceptions: true,
-      timeout: 55
+      muteHttpExceptions:true, timeout:55
     });
-    if (res.getResponseCode() === 200) {
+    if (res.getResponseCode()===200) {
       const text = JSON.parse(res.getContentText())?.choices?.[0]?.message?.content;
-      if (text && text.trim().length > 10) return text.trim();
+      if (text && text.trim().length>10) return text.trim();
+    } else {
+      Logger.log("callAI HTTP "+res.getResponseCode()+": "+res.getContentText().substring(0,200));
     }
-  } catch(e) { 
-    Logger.log("OpenRouter: " + e); 
-  }
+  } catch(e) { Logger.log("callAI: "+e); }
   return null;
 }
 
@@ -124,6 +128,18 @@ function isValidSymbol(sym) {
     if(res.getResponseCode()===200){const d=JSON.parse(res.getContentText());if(d&&d.c&&d.c.length>0)return true;}
   } catch(e) {}
   return false;
+}
+
+// Quy đổi ngân sách kiểu viết tắt VN: "1tr"/"1 triệu" → ×1,000,000, "500k"/"500 nghìn" → ×1,000, số thuần → giữ nguyên (VND)
+function parseVNAmount(str) {
+  if(!str) return NaN;
+  const s=str.trim().toLowerCase().replace(",",".");
+  let m=s.match(/^([\d.]+)\s*(tr|triệu|trieu)$/);
+  if(m) return parseFloat(m[1])*1000000;
+  m=s.match(/^([\d.]+)\s*(k|nghìn|nghin)$/);
+  if(m) return parseFloat(m[1])*1000;
+  const num=parseFloat(s);
+  return (/^[\d.]+$/.test(s) && !isNaN(num)) ? num : NaN;
 }
 
 // =====================================
@@ -569,6 +585,49 @@ function analyzeStockAsync() {
 function getHoldList(chatId){try{const r=PropertiesService.getScriptProperties().getProperty("HOLD_"+chatId);return r?JSON.parse(r):{};}catch(e){return {};}}
 function saveHoldList(chatId,hold){PropertiesService.getScriptProperties().setProperty("HOLD_"+chatId,JSON.stringify(hold));}
 
+// =====================================
+// 🔔 /noti — Cảnh báo giá
+// =====================================
+function getAlerts(chatId){try{const r=PropertiesService.getScriptProperties().getProperty("ALERT_"+chatId);return r?JSON.parse(r):{};}catch(e){return {};}}
+function saveAlerts(chatId,alerts){PropertiesService.getScriptProperties().setProperty("ALERT_"+chatId,JSON.stringify(alerts));}
+
+function handleNoti(chatId,argStr) {
+  if(!argStr){
+    const alerts=getAlerts(chatId);
+    const syms=Object.keys(alerts);
+    if(!syms.length){sendMsg(chatId,"📭 Bạn chưa có cảnh báo giá nào.\nCú pháp: /noti HAG 15");return;}
+    const lines=["🔔 CẢNH BÁO GIÁ ĐANG BẬT","─────────────────────────"];
+    syms.forEach(s=>{
+      const a=alerts[s];
+      lines.push(s+": mục tiêu "+a.target+(a.lastPrice!=null?" (giá gần nhất: "+a.lastPrice+")":" (đang chờ giá đầu tiên)"));
+    });
+    sendMsg(chatId,lines.join("\n"));
+    return;
+  }
+  const parts=argStr.trim().split(/\s+/);
+  if(parts[0].toUpperCase()==="DEL"){
+    if(parts.length<2){sendMsg(chatId,"Cú pháp: /noti del HAG");return;}
+    const sym=parts[1].toUpperCase();
+    const alerts=getAlerts(chatId);
+    if(!alerts[sym]){sendMsg(chatId,"❌ Không có cảnh báo cho "+sym+".");return;}
+    delete alerts[sym];
+    saveAlerts(chatId,alerts);
+    sendMsg(chatId,"🗑 Đã xóa cảnh báo "+sym+".");
+    return;
+  }
+  const sym=parts[0].toUpperCase();
+  const target=parseFloat(parts[1]);
+  if(!/^[A-Z]{2,4}$/.test(sym)||parts.length<2||isNaN(target)||target<=0){
+    sendMsg(chatId,"Cú pháp:\n/noti HAG 15       — đặt cảnh báo khi giá HAG chạm/vượt 15\n/noti              — xem cảnh báo đang bật\n/noti del HAG      — xóa cảnh báo HAG");
+    return;
+  }
+  if(!isValidSymbol(sym)){sendMsg(chatId,"❌ Không tìm thấy mã '"+sym+"'.");return;}
+  const alerts=getAlerts(chatId);
+  alerts[sym]={target,lastPrice:null,setAt:new Date().toLocaleDateString("vi-VN")};
+  saveAlerts(chatId,alerts);
+  sendMsg(chatId,"🔔 Đã đặt cảnh báo "+sym+" khi giá chạm/vượt mốc "+target+".\nSẽ tự động thông báo 1 lần rồi tắt (kiểm tra mỗi ~5 phút).");
+}
+
 function handleHold(chatId,argStr) {
   const hold=getHoldList(chatId);
   if(!argStr){handleViewHold(chatId);return;}
@@ -590,22 +649,147 @@ function handleHold(chatId,argStr) {
     analyzeValueSingle(chatId,sym);
     return;
   }
-  if(parts.length>=3&&/^[A-Z]{2,4}$/.test(sym)){
-    if(!isValidSymbol(sym)){sendMsg(chatId,"❌ Không tìm thấy mã '"+sym+"'.");return;}
+  // Ghi nhận mua: đúng 3 phần "mã giá khối_lượng", cả 2 phần sau đều là số (giữ nguyên hành vi cũ)
+  if(parts.length===3&&/^[A-Z]{2,4}$/.test(sym)){
     const price=parseFloat(parts[1]),qty=parseInt(parts[2]);
-    if(isNaN(price)||isNaN(qty)||price<=0||qty<=0){sendMsg(chatId,"Sai định dạng. Ví dụ: /hold VNM 65.70 1000");return;}
-    if(!hold[sym]) hold[sym]={purchases:[]};
-    hold[sym].purchases.push({price,qty,date:new Date().toLocaleDateString("vi-VN")});
-    saveHoldList(chatId,hold);
-    const totalQty=hold[sym].purchases.reduce((s,p)=>s+p.qty,0);
-    const totalCost=hold[sym].purchases.reduce((s,p)=>s+p.price*p.qty,0);
-    // ── Auto-xóa khỏi watchlist khi đã vào tích sản ──
-    const wl=getWatchlist(chatId);let removedWlMsg="";
-    if(wl[sym]){delete wl[sym];saveWatchlist(chatId,wl);removedWlMsg="\n🗑 Tự xóa "+sym+" khỏi watchlist."}
-    sendMsg(chatId,"✅ Ghi nhận mua "+sym+" (lần "+hold[sym].purchases.length+"):\nLần này: "+qty+" cổ @ "+price+"\n─────────────────────────\nTổng: "+totalQty+" cổ | Giá TB: "+(totalCost/totalQty).toFixed(2)+"\nĐầu tư: "+(totalCost/1000).toFixed(0)+"K"+removedWlMsg+"\n\n📊 /scan để xem phân tích toàn bộ.");
+    if(!isNaN(price)&&!isNaN(qty)&&price>0&&qty>0){
+      if(!isValidSymbol(sym)){sendMsg(chatId,"❌ Không tìm thấy mã '"+sym+"'.");return;}
+      if(!hold[sym]) hold[sym]={purchases:[]};
+      hold[sym].purchases.push({price,qty,date:new Date().toLocaleDateString("vi-VN")});
+      saveHoldList(chatId,hold);
+      const totalQty=hold[sym].purchases.reduce((s,p)=>s+p.qty,0);
+      const totalCost=hold[sym].purchases.reduce((s,p)=>s+p.price*p.qty,0);
+      // ── Auto-xóa khỏi watchlist khi đã vào tích sản ──
+      const wl=getWatchlist(chatId);let removedWlMsg="";
+      if(wl[sym]){delete wl[sym];saveWatchlist(chatId,wl);removedWlMsg="\n🗑 Tự xóa "+sym+" khỏi watchlist."}
+      sendMsg(chatId,"✅ Ghi nhận mua "+sym+" (lần "+hold[sym].purchases.length+"):\nLần này: "+qty+" cổ @ "+price+"\n─────────────────────────\nTổng: "+totalQty+" cổ | Giá TB: "+(totalCost/totalQty).toFixed(2)+"\nĐầu tư: "+(totalCost/1000).toFixed(0)+"K"+removedWlMsg+"\n\n📊 /scan để xem phân tích toàn bộ.");
+      return;
+    }
+  }
+
+  // So sánh nhiều mã (2-5 mã, không có ngân sách cuối)
+  const upParts=parts.map(p=>p.toUpperCase());
+  if(upParts.length>=2&&upParts.length<=5&&upParts.every(p=>/^[A-Z]{2,4}$/.test(p))){
+    runHoldCompare(chatId,upParts,null);
     return;
   }
-  sendMsg(chatId,"Cú pháp:\n/hold              — xem tích sản (tự quét nếu chưa có)\n/hold VNM          — phân tích VNM ngay\n/hold VNM 65.70 1000 — ghi nhận mua");
+
+  // Phân bổ vốn (2-5 mã + 1 token ngân sách dạng "1tr"/"500k"/số thuần)
+  if(upParts.length>=3&&upParts.length<=6){
+    const syms=upParts.slice(0,-1);
+    const budget=parseVNAmount(parts[parts.length-1]);
+    if(syms.length>=2&&syms.length<=5&&syms.every(s=>/^[A-Z]{2,4}$/.test(s))&&!isNaN(budget)&&budget>0){
+      runHoldCompare(chatId,syms,budget);
+      return;
+    }
+  }
+
+  sendMsg(chatId,"Cú pháp:\n/hold                  — xem tích sản (tự quét nếu chưa có)\n/hold VNM              — phân tích VNM ngay\n/hold VNM 65.70 1000   — ghi nhận mua\n/hold VNM HAG VCB      — so sánh 2-5 mã, chọn mã tốt nhất\n/hold VNM HAG VCB 1tr  — so sánh + phân bổ vốn 1 triệu VND theo điểm chất lượng");
+}
+
+// =====================================
+// ⚖️ /hold — SO SÁNH & PHÂN BỔ VỐN nhiều mã (code thuần, KHÔNG dùng AI để tính điểm/phân bổ)
+// =====================================
+function runHoldCompare(chatId,syms,budget) {
+  sendMsg(chatId,"⏳ Đang "+(budget?"phân bổ vốn":"so sánh")+" "+syms.length+" mã: "+syms.join(", ")+"...");
+  const props=PropertiesService.getScriptProperties();
+  props.setProperty("HOLD_CMP_CHAT_ID",chatId);
+  props.setProperty("HOLD_CMP_SYMS",JSON.stringify(syms));
+  props.setProperty("HOLD_CMP_BUDGET",budget?String(budget):"");
+  deleteAllTriggers("holdCompareAsync");
+  ScriptApp.newTrigger("holdCompareAsync").timeBased().after(100).create();
+}
+
+function holdCompareAsync() {
+  deleteAllTriggers("holdCompareAsync");
+  const props=PropertiesService.getScriptProperties();
+  const chatId=props.getProperty("HOLD_CMP_CHAT_ID");
+  const symsRaw=props.getProperty("HOLD_CMP_SYMS");
+  const budgetRaw=props.getProperty("HOLD_CMP_BUDGET");
+  props.deleteProperty("HOLD_CMP_CHAT_ID");props.deleteProperty("HOLD_CMP_SYMS");props.deleteProperty("HOLD_CMP_BUDGET");
+  if(!chatId||!symsRaw) return;
+  let syms;
+  try{ syms=JSON.parse(symsRaw); }catch(e){ sendMsg(chatId,"❌ Lỗi đọc danh sách mã."); return; }
+  const budget=budgetRaw?parseFloat(budgetRaw):null;
+
+  // Validate mã tồn tại
+  const validSyms=syms.filter(s=>isValidSymbol(s));
+  const invalidSyms=syms.filter(s=>!validSyms.includes(s));
+  if(validSyms.length<2){sendMsg(chatId,"❌ Cần ít nhất 2 mã hợp lệ để "+(budget?"phân bổ vốn":"so sánh")+".\n"+(invalidSyms.length?"Không hợp lệ: "+invalidSyms.join(", "):""));return;}
+
+  // Lấy điểm chất lượng — code thuần, không dùng AI để tính điểm
+  const qualityResults=apiBatch(validSyms.map(s=>"/quality/"+s),20);
+  const rows=[];
+  validSyms.forEach((s,i)=>{
+    const q=qualityResults[i];
+    if(q&&typeof q.score==="number"){
+      rows.push({sym:s,score:q.score,rating:q.rating||"",recommendation:q.recommendation||"",reasons:q.reasons||[]});
+    }
+  });
+  const noScoreSyms=validSyms.filter(s=>!rows.find(r=>r.sym===s));
+  if(!rows.length){sendMsg(chatId,"❌ Không lấy được điểm chất lượng cho mã nào trong nhóm.");return;}
+  rows.sort((a,b)=>b.score-a.score);
+
+  // ── Chế độ SO SÁNH (không ngân sách) ──
+  if(!budget){
+    const lines=["📊 SO SÁNH TÍCH SẢN "+rows.length+" MÃ","─────────────────────────"];
+    rows.forEach((r,i)=>{
+      const medal=i===0?"🥇 ":i===1?"🥈 ":i===2?"🥉 ":"   #"+(i+1)+" ";
+      lines.push(medal+r.sym+" | "+r.score+"/100 — "+r.rating+(r.recommendation?" — "+r.recommendation:""));
+    });
+    if(invalidSyms.length) lines.push("\n⚠ Mã không hợp lệ: "+invalidSyms.join(", "));
+    if(noScoreSyms.length) lines.push("⚠ Không lấy được điểm: "+noScoreSyms.join(", "));
+    lines.push("\n◆◆◆ MÃ TỐT NHẤT: "+rows[0].sym+" ("+rows[0].score+"/100) ◆◆◆");
+    sendLongMsg(chatId,lines.join("\n"));
+
+    const aiCtx=rows.map(r=>r.sym+"="+r.score+"đ("+r.rating+")").join(", ");
+    const aiText=callAI("So sánh tích sản dài hạn các mã: "+aiCtx+". Mã điểm cao nhất là "+rows[0].sym+". Giải thích ngắn gọn (2-3 câu) vì sao "+rows[0].sym+" là lựa chọn tốt nhất để tích sản dài hạn trong nhóm này, dựa trên các điểm số đã cho. Tiếng Việt có dấu, không chèn link, không tự tính lại điểm.");
+    if(aiText) sendMsg(chatId,"🤖 "+(cleanAIText(aiText)||""));
+    return;
+  }
+
+  // ── Chế độ PHÂN BỔ VỐN (code thuần) ──
+  const totalScore=rows.reduce((s,r)=>s+r.score,0);
+  if(totalScore<=0){sendMsg(chatId,"❌ Không thể phân bổ vốn vì tổng điểm chất lượng bằng 0.");return;}
+
+  const priceResults=apiBatch(rows.map(r=>"/stock/"+r.sym),20);
+  const alloc=[];
+  let totalAllocated=0;
+  rows.forEach((r,i)=>{
+    const priceData=priceResults[i];
+    const priceK=(priceData&&priceData.close)?parseFloat(priceData.close):null; // đơn vị nghìn đồng, giữ nguyên quy ước hiện có
+    const weight=r.score/totalScore;
+    const moneyForSym=budget*weight;
+    if(!priceK||priceK<=0){
+      alloc.push({sym:r.sym,score:r.score,weight,priceK:null,qty:0,spent:0});
+      return;
+    }
+    const realPrice=priceK*1000; // giá thực VND
+    let qty=Math.floor(moneyForSym/realPrice);
+    if(qty>=100) qty=Math.floor(qty/100)*100; // làm tròn xuống bội số lô 100, giữ nguyên nếu <100
+    const spent=qty*realPrice;
+    totalAllocated+=spent;
+    alloc.push({sym:r.sym,score:r.score,weight,priceK,qty,spent});
+  });
+  const remainder=budget-totalAllocated;
+
+  const lines=["💰 PHÂN BỔ VỐN TÍCH SẢN — Ngân sách: "+budget.toLocaleString("vi-VN")+" đ","─────────────────────────"];
+  alloc.forEach(a=>{
+    if(!a.priceK){ lines.push(a.sym+": ⚪ Không lấy được giá — bỏ qua"); return; }
+    lines.push(a.sym+": "+a.qty+" cổ @ "+a.priceK.toFixed(2)+" (điểm "+a.score+"/100, tỷ trọng "+(a.weight*100).toFixed(1)+"%) = "+a.spent.toLocaleString("vi-VN")+" đ");
+  });
+  lines.push("─────────────────────────");
+  lines.push("Tổng đã phân bổ: "+totalAllocated.toLocaleString("vi-VN")+" đ");
+  lines.push("Dư do làm tròn lô: "+remainder.toLocaleString("vi-VN")+" đ");
+  if(invalidSyms.length) lines.push("\n⚠ Mã không hợp lệ: "+invalidSyms.join(", "));
+  if(noScoreSyms.length) lines.push("⚠ Không lấy được điểm (đã loại khỏi rổ): "+noScoreSyms.join(", "));
+  sendLongMsg(chatId,lines.join("\n"));
+
+  const aiCtx=alloc.filter(a=>a.priceK).map(a=>a.sym+"="+a.qty+"cổ("+a.score+"đ)").join(", ");
+  if(aiCtx){
+    const aiText=callAI("Phân bổ vốn tích sản dài hạn theo điểm chất lượng (đã tính sẵn bằng code, KHÔNG thay đổi số liệu): "+aiCtx+". Giải thích ngắn gọn (2-3 câu) cơ sở của cách phân bổ này và lưu ý rủi ro. Tiếng Việt có dấu, không chèn link.");
+    if(aiText) sendMsg(chatId,"🤖 "+(cleanAIText(aiText)||""));
+  }
 }
 
 // runHoldScan — quét TT tìm mã tích sản (tự động khi /hold và danh sách trống)
@@ -1775,16 +1959,21 @@ function doPost(e) {
         "/stock HAG         — Thêm mã vào watchlist\n"+
         "/hold VNM 65.70 1000 — Ghi nhận mua tích sản (tự tính giá TB)\n"+
         "/hold              — Xem tích sản + AI phân tích (tự quét nếu danh sách trống)\n"+
+        "/hold VNM HAG VCB  — So sánh 2-5 mã tích sản, chọn mã tốt nhất\n"+
+        "/hold VNM HAG VCB 1tr — Phân bổ vốn (1 triệu) theo điểm chất lượng\n"+
         "/gold 0.5 103500   — Mua 0.5 chỉ vàng giá 103tr5/lượng\n"+
         "/delete VNM EIB    — Xóa mã khỏi danh sách\n"+
-        "/delete gold 0.5 103500 — Bán vàng, tính lãi/lỗ\n\n"+
+        "/delete gold 0.5 103500 — Bán vàng, tính lãi/lỗ\n"+
+        "/noti HAG 15       — Cảnh báo khi giá HAG chạm/vượt 15\n"+
+        "/noti              — Xem cảnh báo đang bật\n"+
+        "/noti del HAG      — Xóa cảnh báo HAG\n\n"+
         "━━━ TIỆN ÍCH ━━━\n"+
         "/set1 8h30         — Sáng: BẢN TIN VIP + quét TT + danh mục (T2-T6)\n"+
         "/set2 15h30        — Chiều: chỉ phân tích danh mục/tích sản/watchlist (T2-T6)\n"+
         "/setgold 10h00     — Lịch báo giá vàng hàng ngày\n"+
         "/myschedule        — Xem lịch báo cáo tự động\n"+
-        "/aistatus          — Trạng thái AI (Groq/Gemini)\n"+
-        "/resetcache        — Reset cache AI khi lỗi\n"+
+        "/aistatus          — Trạng thái AI (DeepSeek qua ds2api)\n"+
+        "/resetcache        — (Không còn cần thiết — ds2api tự xoay vòng)\n"+
         "/forcescan         — Reset lock khi /scan bị treo\n"+
         "/inittrigger       — Tạo lại trigger lịch khi bị mất"
       );
@@ -1800,6 +1989,7 @@ function doPost(e) {
     else if(up==="/STOCK")                     {sendMsg(chatId,"Cú pháp: /stock HAG");}
     else if(up==="/HOLD"||up.startsWith("/HOLD ")) {handleHold(chatId,arg||"");}
     else if(up==="/GOLD"||up.startsWith("/GOLD ")) {handleGold(chatId,arg||"");}
+    else if(up==="/NOTI"||up.startsWith("/NOTI ")) {handleNoti(chatId,arg||"");}
     else if(up==="/DELETE"||up.startsWith("/DELETE ")) {handleDelete(chatId,arg);}
 
     else if(up==="/MYSCHEDULE"){
@@ -1820,13 +2010,7 @@ function doPost(e) {
     else if(up==="/AISTATUS")           {handleAIStatus(chatId);}
     else if(up==="/INITTRIGGER")        {handleInitTriggerCmd(chatId);}
     else if(up==="/RESETCACHE"){
-      const props=PropertiesService.getScriptProperties();
-      const all=props.getProperties();const unlocked=[];let cc=0;
-      for(const k of Object.keys(all)){
-        if(k.startsWith("QUOTA_LOCK_")){unlocked.push(k.replace("QUOTA_LOCK_",""));props.deleteProperty(k);}
-        else if(k==="GEMINI_MODELS_CACHE"||k==="GEMINI_MODELS_TS"){props.deleteProperty(k);cc++;}
-      }
-      sendMsg(chatId,"✅ Reset cache AI!\n"+(unlocked.length?"Mở khoá: "+unlocked.join(", ")+"\n":"")+(cc?"Xóa cache model.\n":"")+"\n👉 /aistatus để xác nhận.");
+      sendMsg(chatId,"ℹ️ Không cần reset thủ công nữa — AI hiện dùng DeepSeek qua ds2api, ds2api tự động xoay vòng tài khoản khi có lỗi/hết quota.\n👉 /aistatus để xem trạng thái hiện tại.");
     }
     else if(up==="/SCAN"||up==="/FORCESCAN"){
       const props=PropertiesService.getScriptProperties();
@@ -1871,26 +2055,14 @@ function doPost(e) {
 // 📊 AI STATUS
 // =====================================
 function handleAIStatus(chatId) {
-  const seen={};
-  for(const cfg of buildGeminiQueue()){
-    if(!seen[cfg.model])seen[cfg.model]={k1:false,k2:false,lockMins:[]};
-    const locked=isQuotaLocked(cfg.label);
-    const ts=PropertiesService.getScriptProperties().getProperty("QUOTA_LOCK_"+cfg.label);
-    if(!locked)cfg.label.endsWith("-K1")?(seen[cfg.model].k1=true):(seen[cfg.model].k2=true);
-    else if(ts)seen[cfg.model].lockMins.push(Math.ceil((QUOTA_COOLDOWN_MS-(Date.now()-parseInt(ts)))/60000));
-  }
-  const active=[],locked=[];
-  for(const[model,s]of Object.entries(seen)){
-    const short=model.replace("gemini-","").replace("-preview","★");
-    const keyTag=s.k1&&s.k2?"(2 key)":s.k1?"(key1)":"(key2)";
-    if(s.k1||s.k2)active.push("🟢 "+short+" "+keyTag);
-    else locked.push("🔴 "+short+" — reset sau ~"+(s.lockMins.length?Math.min(...s.lockMins):"?")+"p");
-  }
-  const groqOk=GROQ_API_KEY&&!GROQ_API_KEY.startsWith('PASTE_');
-  let msg="🤖 Trạng thái AI\nThứ tự: Groq → Gemini\n─────────────────────────\n";
-  msg+=(groqOk?"🟢":"🔴")+" Groq Llama 3.3 (ưu tiên 1)\n";
-  if(active.length)msg+="\nGemini hoạt động:\n"+active.join("\n")+"\n";
-  if(locked.length)msg+="\nGemini hết quota:\n"+locked.join("\n")+"\n";
+  const keyOk  = DS2API_KEY && !DS2API_KEY.startsWith('PASTE_');
+  const urlOk  = DS2API_BASE_URL && !DS2API_BASE_URL.startsWith('PASTE_');
+  const ok = keyOk && urlOk;
+  let msg="🤖 Trạng thái AI\nProvider: DeepSeek (qua ds2api)\n─────────────────────────\n";
+  msg+=(ok?"🟢":"🔴")+" Model: "+DS2API_MODEL+"\n";
+  msg+="Endpoint: "+(urlOk?DS2API_BASE_URL:"⚠️ chưa cấu hình DS2API_BASE_URL")+"\n";
+  msg+="Key: "+(keyOk?"✅ đã cấu hình":"⚠️ chưa cấu hình DS2API_KEY")+"\n";
+  msg+="\nds2api tự động xoay vòng nhiều tài khoản DeepSeek — bot không cần fallback thủ công.";
   sendMsg(chatId,msg);
 }
 
@@ -1945,6 +2117,38 @@ function checkSchedules() {
     catch(e){Logger.log("gold price daily: "+e);}
   }
   if(vnTime.getDay()===0||vnTime.getDay()===6)return;
+
+  // ── Cảnh báo giá /noti — chạy trong trigger checkSchedules có sẵn (mỗi 5 phút) ──
+  const alertChatIds=new Set();
+  for(const key of Object.keys(propsAll)){
+    if(key.startsWith("ALERT_")) alertChatIds.add(key.replace("ALERT_",""));
+  }
+  alertChatIds.forEach(cid=>{
+    const alerts=getAlerts(cid);
+    const syms=Object.keys(alerts);
+    if(!syms.length)return;
+    let prices;
+    try{ prices=fetchRealtimePrices(syms); }catch(e){ Logger.log("checkSchedules alert prices "+cid+": "+e); return; }
+    let changed=false;
+    syms.forEach(sym=>{
+      const cur=prices[sym];
+      if(cur==null)return;
+      const a=alerts[sym];
+      if(a.lastPrice==null){
+        a.lastPrice=cur; changed=true; return;
+      }
+      const crossedUp=a.lastPrice<a.target&&cur>=a.target;
+      const crossedDown=a.lastPrice>a.target&&cur<=a.target;
+      if(crossedUp||crossedDown){
+        sendMsg(cid,"🔔 CẢNH BÁO GIÁ\n"+sym+" đã chạm mốc "+a.target+" (giá hiện tại: "+cur+")");
+        delete alerts[sym]; changed=true;
+      } else if(cur!==a.lastPrice){
+        a.lastPrice=cur; changed=true;
+      }
+    });
+    if(changed) saveAlerts(cid,alerts);
+  });
+
   const props=PropertiesService.getScriptProperties().getProperties();
   for(const key of Object.keys(props)){
     const match=key.match(/^SCHEDULE([12])_(.+)$/);if(!match)continue;
@@ -2061,15 +2265,16 @@ function setupBotCommands() {
       {command:"news",        description:"Tin tức cổ phiếu: /news FPT"},
       {command:"buy",         description:"Danh mục ngắn hạn: /buy HAG 15.2 500"},
       {command:"stock",       description:"Thêm mã theo dõi: /stock HAG 14.5"},
-      {command:"hold",        description:"Tích sản: /hold | /hold VNM | /hold VNM 65.70 1000"},
+      {command:"hold",        description:"Tích sản: /hold | /hold VNM | /hold VNM 65.70 1000 | /hold VNM HAG VCB [ngân sách]"},
       {command:"gold",        description:"Tài sản vàng: /gold 0.5 103500"},
+      {command:"noti",        description:"Cảnh báo giá: /noti HAG 15 | /noti | /noti del HAG"},
       {command:"delete",      description:"Xóa mã: /delete VNM EIB | Bán vàng: /delete gold 0.5 103500"},
       {command:"set1",        description:"Sáng: BẢN TIN VIP + quét TT + danh mục: /set1 8h30"},
       {command:"set2",        description:"Chiều: chỉ phân tích danh mục/tích sản: /set2 15h30"},
       {command:"setgold",     description:"Lịch báo giá vàng hàng ngày: /setgold 10h00"},
       {command:"myschedule",  description:"Xem lịch báo cáo tự động"},
-      {command:"aistatus",    description:"Trạng thái AI đang dùng (Groq/Gemini)"},
-      {command:"resetcache",  description:"Reset cache AI khi lỗi"},
+      {command:"aistatus",    description:"Trạng thái AI đang dùng (DeepSeek qua ds2api)"},
+      {command:"resetcache",  description:"(Không còn cần thiết — ds2api tự xoay vòng tài khoản)"},
       {command:"forcescan",   description:"Reset lock khi /scan bị treo"},
       {command:"inittrigger", description:"Tạo lại trigger lịch khi bị mất sau deploy"}
     ]}),muteHttpExceptions:true
