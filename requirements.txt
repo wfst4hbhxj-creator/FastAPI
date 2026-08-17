@@ -11,8 +11,12 @@ pydantic==2.10.4
 # --- VNStock v4 ---
 vnstock==4.0.4
 
+# --- HTTP trực tiếp (Lớp 2 fallback fund-holdings gọi thẳng fmarket.vn) ---
+# Đã là dependency gián tiếp của vnstock, khai báo rõ vì main.py giờ import trực tiếp
+requests
+
 # --- DNSE OpenAPI (Market Data) ---
-dnse-sdk
+openapi-sdk
 
 # --- Core Dependencies ---
 # Unpinned pandas so pip uses the latest pre-compiled wheel (avoids building from source)

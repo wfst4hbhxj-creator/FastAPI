@@ -1814,11 +1814,13 @@ function recommendAsync() {
   const favData = apiGet("/fund-favorites", 60);
   let symbols = [];
   const seen = {};
+  let anyStale = false;
 
   if(favData && typeof favData === "object") {
     Object.values(favData).forEach(holdings=>{
       if(!Array.isArray(holdings)) return;
       holdings.forEach(h=>{
+        if(h && h.stale) anyStale = true;
         const sym = (h.stock_code||h.symbol||h.ticker||"").toUpperCase();
         if(sym && /^[A-Z]{2,4}$/.test(sym) && !seen[sym]) {
           seen[sym] = true;
@@ -1829,8 +1831,20 @@ function recommendAsync() {
   }
 
   if(!symbols.length) {
-    sendMsg(chatId, "❌ Không lấy được dữ liệu quỹ (DCDS/DCDE). Server có thể đang bận hoặc khởi động. Vui lòng thử lại sau 1-2 phút.");
+    if(favData && typeof favData === "object") {
+      // Backend đã phản hồi hợp lệ nhưng không có mã nào — nghĩa là cả 4 lớp fallback
+      // fund-holdings ở backend (vnstock → fmarket trực tiếp → cache cũ → snapshot tĩnh)
+      // đều không có dữ liệu. Khác hẳn với lỗi kết nối/server bên dưới.
+      sendMsg(chatId, "❌ Quỹ DCDS/DCDE hiện không có dữ liệu holdings nào (đã thử tất cả nguồn dự phòng ở backend). Có thể fmarket.vn gián đoạn kéo dài hoặc snapshot dự phòng chưa được cập nhật. Vui lòng thử lại sau hoặc kiểm tra log backend.");
+    } else {
+      // apiGet không trả được kết quả gì — lỗi mạng/server thật sự (timeout, 500, đang khởi động...)
+      sendMsg(chatId, "❌ Không kết nối được tới server để lấy dữ liệu quỹ. Server có thể đang bận hoặc khởi động. Vui lòng thử lại sau 1-2 phút.");
+    }
     return;
+  }
+
+  if(anyStale) {
+    sendMsg(chatId, "⚠️ Lưu ý: một phần dữ liệu quỹ đang dùng bản lưu tạm (fmarket.vn có thể đang gián đoạn), kết quả bên dưới có thể không phải mới nhất.");
   }
 
   // Chọn tối đa 12 mã để quét tuần tự (tránh OOM server)

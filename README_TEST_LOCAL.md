@@ -49,7 +49,18 @@ curl http://localhost:8000/health
 curl http://localhost:8000/stock/VNM        # xem field "source": "dnse" hay "vnstock"
 curl http://localhost:8000/quality/FPT
 curl http://localhost:8000/hold/HAG
+curl http://localhost:8000/fund-favorites   # xem field "stale":true nếu đang fallback lớp 3/4
 ```
 
 Nếu thấy `"source":"dnse"` nghĩa là DNSE OpenAPI đang hoạt động và trả giá thật.
 Nếu thấy `"source":"vnstock"` nghĩa là DNSE lỗi/thiếu cấu hình và đã fallback đúng như thiết kế.
+
+## 5. Về `/fund-favorites`, `/growth-stocks`, `/dividend-kings` (dữ liệu quỹ DCDS/DCDE/DCBF)
+
+`_fetch_fund_holdings()` trong `main.py` giờ có 4 lớp fallback: vnstock (có retry) → gọi thẳng
+fmarket.vn → cache cũ (stale) → snapshot tĩnh `FUND_HOLDINGS_FALLBACK` (khung rỗng, bạn tự điền tay
+hàng tháng theo hướng dẫn trong comment ngay phía trên biến đó trong `main.py`). Nếu response có
+field `"stale": true` trên các dòng holding, nghĩa là dữ liệu không đến từ lớp 1/2 (vnstock/fmarket
+trực tiếp) mà từ cache cũ hoặc snapshot tĩnh — kiểm tra log server (`_fetch_fund_holdings...`) để biết
+chính xác đang rơi vào lớp nào.
+

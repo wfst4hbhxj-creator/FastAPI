@@ -6,6 +6,7 @@ from typing import Optional, List
 import logging
 import os
 import time
+import requests
 from datetime import date, timedelta, datetime
 
 try:
@@ -176,18 +177,158 @@ def _dnse_get_latest_quote(symbol):
         logger.warning(f"DNSE get_latest_quote {symbol}: {e}")
     return None
 
+# =====================================
+# 🏦 FUND HOLDINGS — 4 lớp fallback (dừng ở lớp đầu tiên thành công)
+# Sửa lỗi "Không lấy được dữ liệu quỹ (DCDS/DCDE)": trước đây chỉ có 1 lệnh gọi vnstock
+# (bọc trong except: pass ở tầng endpoint) nên fmarket.vn chập chờn là mất hết dữ liệu.
+# =====================================
+
+# Lớp 2 — gọi thẳng public API fmarket.vn, KHÔNG qua vnstock.
+# Endpoint/method/headers/payload dưới đây COPY Y HỆT từ source code vnstock==4.0.4 đã cài
+# (pip show vnstock -> Location: site-packages), cụ thể tại 2 file:
+#   - site-packages/vnstock/explorer/fmarket/const.py  → _BASE_URL
+#   - site-packages/vnstock/explorer/fmarket/fund.py    → Fund.filter() và Fund.top_holding()
+#   - site-packages/vnstock/core/utils/user_agent.py    → get_headers(data_source="fmarket")
+#     (Referer/Origin "https://fmarket.vn/", Content-Type application/json)
+# Đây là fallback ĐỘC LẬP với lớp 1: nếu vnstock có bug/lỗi phiên bản trong wrapper (chứ không
+# phải bản thân fmarket.vn chết), gọi thẳng endpoint gốc vẫn có thể thành công.
+FMARKET_BASE_URL = "https://api.fmarket.vn/res/products"
+FMARKET_HEADERS = {
+    "Accept": "application/json, text/plain, */*",
+    "Content-Type": "application/json",
+    "Referer": "https://fmarket.vn/",
+    "Origin": "https://fmarket.vn/",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                  "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+}
+
+def _fmarket_direct_top_holding(fund_name):
+    """
+    Copy lại đúng 2 bước mà vnstock.explorer.fmarket.fund.Fund thực hiện nội bộ:
+      1. POST {FMARKET_BASE_URL}/filter — tra fundId từ short_name (vd "DCDS")
+      2. GET  {FMARKET_BASE_URL}/{fundId} — lấy productTopHoldingList + productTopHoldingBondList
+    Trả về list[dict] cùng field name với kết quả lớp 1 (đã _serialize) để không phá vỡ schema.
+    Raise Exception nếu lỗi — để hàm gọi (_fetch_fund_holdings) tự bắt và rơi xuống lớp 3.
+    """
+    fund_name = fund_name.upper()
+    filter_payload = {"searchField": fund_name, "types": ["NEW_FUND", "TRADING_FUND"], "pageSize": 100}
+    r1 = requests.post(f"{FMARKET_BASE_URL}/filter", json=filter_payload, headers=FMARKET_HEADERS, timeout=10)
+    r1.raise_for_status()
+    rows = ((r1.json() or {}).get("data") or {}).get("rows") or []
+    match = next((row for row in rows if str(row.get("shortName", "")).upper() == fund_name), None)
+    if not match:
+        raise ValueError(f"fmarket trực tiếp: không tìm thấy quỹ '{fund_name}' trong kết quả filter")
+    fund_id = int(match["id"])
+
+    r2 = requests.get(f"{FMARKET_BASE_URL}/{fund_id}", headers=FMARKET_HEADERS, timeout=10)
+    r2.raise_for_status()
+    body = (r2.json() or {}).get("data") or {}
+
+    rows_out = []
+    for item in (body.get("productTopHoldingList") or []) + (body.get("productTopHoldingBondList") or []):
+        rows_out.append({
+            "stock_code": item.get("stockCode"),
+            "industry": item.get("industry"),
+            "net_asset_percent": item.get("netAssetPercent"),
+            "type_asset": item.get("type"),
+            "update_at": item.get("updateAt"),
+            "fundId": fund_id,
+            "short_name": fund_name,
+        })
+    if not rows_out:
+        raise ValueError(f"fmarket trực tiếp: fundId={fund_id} không có top holding nào")
+    return rows_out
+
+# Lớp 3 — "cache cuối cùng thành công", tách khỏi _cache/TTL_FUND (KHÔNG bao giờ tự hết hạn,
+# chỉ bị ghi đè khi có lần fetch mới thành công). Đây là bộ nhớ trong process, sẽ mất khi Render
+# restart instance — chấp nhận được vì mục đích chỉ là chống gián đoạn tạm thời của fmarket.vn.
+_fund_holdings_last_good: dict = {}
+
+# Lớp 4 — snapshot tĩnh dự phòng (last resort), CHỈ dùng khi lớp 1+2+3 đều thất bại và
+# CHƯA TỪNG có lần fetch nào thành công kể từ khi service khởi động (ví dụ mới deploy lần đầu).
+# ⚠️ Claude KHÔNG tự bịa số liệu — các list dưới đây để RỖNG, người dùng tự điền tay hàng tháng
+# từ bài công bố định kỳ của Dragon Capital tại dautu.dragoncapital.com.vn/tin-tuc/...
+# (trang bài viết văn bản thường, không bị chặn robots — khác 3 link sản phẩm dạng JS).
+# Format mỗi phần tử PHẢI giống hệt các lớp trên để không phá vỡ schema, ví dụ:
+#   {"stock_code": "HPG", "industry": "Vật liệu xây dựng", "net_asset_percent": 8.5,
+#    "type_asset": "STOCK", "update_at": "2026-08-01", "fundId": None, "short_name": "DCDS"}
+FUND_HOLDINGS_FALLBACK = {
+    "DCDS": [],  # TODO: người dùng tự điền top 10 holding DCDS (xem format ở comment trên)
+    "DCDE": [],  # TODO: người dùng tự điền top 10 holding DCDE
+    "DCBF": [],  # TODO: người dùng tự điền top 10 holding DCBF
+}
+
 def _fetch_fund_holdings(fund_name):
+    """
+    Lấy top holding quỹ mở, 4 lớp fallback theo thứ tự, dừng ở lớp đầu tiên thành công:
+      1. vnstock (Reference → Market), retry tối đa 2 lần, backoff 1.5s/3s
+         (timeout mỗi request đã có sẵn trong vnstock.core.utils.client.send_request, mặc định 30s)
+      2. Gọi thẳng fmarket.vn (_fmarket_direct_top_holding) — độc lập với bug wrapper vnstock
+      3. Cache cũ nhất từng thành công (_fund_holdings_last_good), bất kể đã hết TTL_FUND
+      4. Snapshot tĩnh FUND_HOLDINGS_FALLBACK do người dùng tự cập nhật tay
+    Field "stale": true được thêm vào mỗi holding khi dữ liệu đến từ lớp 3 hoặc lớp 4,
+    để bot/AI biết dữ liệu có thể không còn mới nhất — các field cũ khác giữ nguyên.
+    """
     key = f"fund_holdings_{fund_name}"
     cached = _cache_get(key)
     if cached is not None:
         return cached
+
+    def _remember_success(result):
+        _cache_set(key, result, TTL_FUND)
+        _fund_holdings_last_good[fund_name] = {"data": result, "ts": time.time()}
+
+    # ── Lớp 1: vnstock, retry tối đa 2 lần ──
+    delays = [1.5, 3]
+    last_err = None
+    for attempt in range(len(delays) + 1):
+        try:
+            data = Reference().fund(fund_name).top_holding()
+            result = _serialize(data)
+            if result:
+                _remember_success(result)
+                return result
+        except Exception as e:
+            last_err = e
+        try:
+            data = Market().fund(fund_name).top_holding()
+            result = _serialize(data)
+            if result:
+                _remember_success(result)
+                return result
+        except Exception as e:
+            last_err = e
+        if attempt < len(delays):
+            logger.warning(f"_fetch_fund_holdings({fund_name}) lớp 1 lỗi (lần {attempt+1}/{len(delays)+1}): {last_err} — thử lại sau {delays[attempt]}s")
+            time.sleep(delays[attempt])
+    logger.warning(f"_fetch_fund_holdings({fund_name}) — lớp 1 (vnstock) thất bại sau {len(delays)+1} lần thử: {last_err}")
+
+    # ── Lớp 2: gọi thẳng fmarket.vn ──
     try:
-        data = Reference().fund(fund_name).top_holding()
-    except Exception:
-        data = Market().fund(fund_name).top_holding()
-    result = _serialize(data)
-    _cache_set(key, result, TTL_FUND)
-    return result
+        result = _fmarket_direct_top_holding(fund_name)
+        if result:
+            _remember_success(result)
+            logger.info(f"_fetch_fund_holdings({fund_name}) — lớp 1 thất bại, lớp 2 (fmarket trực tiếp) thành công")
+            return result
+    except Exception as e:
+        logger.warning(f"_fetch_fund_holdings({fund_name}) — lớp 2 (fmarket trực tiếp) lỗi: {e}")
+
+    # ── Lớp 3: cache cũ (stale), không theo TTL ──
+    stale = _fund_holdings_last_good.get(fund_name)
+    if stale:
+        age_min = round((time.time() - stale["ts"]) / 60, 1)
+        logger.warning(f"_fetch_fund_holdings({fund_name}) — lớp 1+2 thất bại, dùng cache cũ (stale, {age_min} phút trước)")
+        result = [dict(row, stale=True) for row in stale["data"]]
+        return result
+
+    # ── Lớp 4: snapshot tĩnh dự phòng ──
+    fallback = FUND_HOLDINGS_FALLBACK.get(fund_name.upper()) or []
+    if fallback:
+        logger.warning(f"⚠️ _fetch_fund_holdings({fund_name}) — TẤT CẢ lớp 1/2/3 thất bại, dùng snapshot tĩnh FUND_HOLDINGS_FALLBACK (dữ liệu có thể đã cũ — cần cập nhật tay).")
+        return [dict(row, stale=True) for row in fallback]
+
+    logger.error(f"❌ _fetch_fund_holdings({fund_name}) — cả 4 lớp đều không có dữ liệu.")
+    return []
 
 # ===== META =====
 
@@ -838,8 +979,3 @@ def get_dividend_kings():
             pass
     result = sorted(candidates, key=lambda x: (x.get("dividend_count", 0), x.get("score", 0)), reverse=True)
     return {"count": len(result), "stocks": result[:20]}
-
-if __name__ == "__main__":
-    import uvicorn
-    port = int(os.getenv("PORT", 8000))
-    uvicorn.run("main:app", host="0.0.0.0", port=port)
