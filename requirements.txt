@@ -16,7 +16,11 @@ vnstock==4.0.4
 requests
 
 # --- DNSE OpenAPI (Market Data) ---
-openapi-sdk
+# Lưu ý: tên package pip là dnse-sdk-openapi (KHÔNG phải openapi-sdk như README/api.md gốc
+# của DNSE ghi nhầm). Tên module để import vẫn là "dnse" (from dnse import DNSEClient) —
+# tên package pip khác tên module import, giống trường hợp beautifulsoup4 -> import bs4.
+# Ghim version 2.0.0 (bản mới nhất đã xác nhận trên PyPI) để tránh bản sau đổi API phá vỡ code.
+dnse-sdk-openapi==2.0.0
 
 # --- Core Dependencies ---
 # Unpinned pandas so pip uses the latest pre-compiled wheel (avoids building from source)
