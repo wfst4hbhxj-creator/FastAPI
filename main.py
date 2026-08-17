@@ -7,6 +7,7 @@ import logging
 import os
 import time
 import requests
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from datetime import date, timedelta, datetime
 
 try:
@@ -212,7 +213,7 @@ def _fmarket_direct_top_holding(fund_name):
     """
     fund_name = fund_name.upper()
     filter_payload = {"searchField": fund_name, "types": ["NEW_FUND", "TRADING_FUND"], "pageSize": 100}
-    r1 = requests.post(f"{FMARKET_BASE_URL}/filter", json=filter_payload, headers=FMARKET_HEADERS, timeout=10)
+    r1 = requests.post(f"{FMARKET_BASE_URL}/filter", json=filter_payload, headers=FMARKET_HEADERS, timeout=6)
     r1.raise_for_status()
     rows = ((r1.json() or {}).get("data") or {}).get("rows") or []
     match = next((row for row in rows if str(row.get("shortName", "")).upper() == fund_name), None)
@@ -220,7 +221,7 @@ def _fmarket_direct_top_holding(fund_name):
         raise ValueError(f"fmarket trực tiếp: không tìm thấy quỹ '{fund_name}' trong kết quả filter")
     fund_id = int(match["id"])
 
-    r2 = requests.get(f"{FMARKET_BASE_URL}/{fund_id}", headers=FMARKET_HEADERS, timeout=10)
+    r2 = requests.get(f"{FMARKET_BASE_URL}/{fund_id}", headers=FMARKET_HEADERS, timeout=6)
     r2.raise_for_status()
     body = (r2.json() or {}).get("data") or {}
 
@@ -258,16 +259,70 @@ FUND_HOLDINGS_FALLBACK = {
     "DCBF": [],  # TODO: người dùng tự điền top 10 holding DCBF
 }
 
+def _bounded_call(fn, args=(), kwargs=None, hard_timeout=6):
+    """
+    Chạy fn(*args, **kwargs) trong 1 thread riêng với timeout CỨNG từ bên ngoài.
+    Dùng khi fn không hỗ trợ truyền timeout ngắn (vd Reference().fund().top_holding() của
+    vnstock — timeout mặc định 30s nằm sâu trong vnstock.core.utils.client.send_request,
+    không có cách nào override từ bên ngoài).
+
+    QUAN TRỌNG — bug đã tự kiểm chứng bằng code thật, PHẢI tránh:
+    KHÔNG được dùng `with ThreadPoolExecutor(...) as ex:` ở đây. __exit__ của context
+    manager gọi shutdown(wait=True) mặc định, khiến hàm vẫn chờ luồng treo chạy xong mới
+    return — phản tác dụng hoàn toàn với mục đích timeout cứng. Cách đúng: tạo executor
+    thủ công, gọi shutdown(wait=False) trong finally để luồng mồ côi tự chết ở background,
+    không block caller.
+
+    Trả None nếu timeout hoặc lỗi (không raise ra ngoài) — caller tự coi None là "thất bại".
+    """
+    kwargs = kwargs or {}
+    executor = ThreadPoolExecutor(max_workers=1)
+    try:
+        future = executor.submit(fn, *args, **kwargs)
+        return future.result(timeout=hard_timeout)
+    except FutureTimeoutError:
+        logger.warning(f"_bounded_call: {getattr(fn, '__name__', fn)} vượt timeout cứng {hard_timeout}s")
+        return None
+    except Exception as e:
+        logger.warning(f"_bounded_call: {getattr(fn, '__name__', fn)} lỗi: {e}")
+        return None
+    finally:
+        executor.shutdown(wait=False)  # KHÔNG chờ luồng treo — để nó tự chết ở background
+
+def _fetch_funds_parallel(fund_names):
+    """
+    Chạy _fetch_fund_holdings() cho nhiều quỹ CÙNG LÚC thay vì tuần tự, để thời gian tổng
+    không cộng dồn theo số quỹ. Trả về dict {fund_name: holdings_list}. Lỗi/timeout của
+    1 quỹ không ảnh hưởng các quỹ khác (trả [] cho quỹ đó).
+    Không dùng `with ThreadPoolExecutor` — lý do giống _bounded_call ở trên.
+    """
+    fund_names = list(fund_names)
+    executor = ThreadPoolExecutor(max_workers=max(1, len(fund_names)))
+    results = {fn: [] for fn in fund_names}
+    try:
+        futures = {executor.submit(_fetch_fund_holdings, fn): fn for fn in fund_names}
+        for future in futures:
+            fn = futures[future]
+            try:
+                # Mỗi _fetch_fund_holdings() đã tự bounded ở bên trong (lớp 1: ~12s, lớp 2: ~12s),
+                # timeout 30s ở đây chỉ là lưới an toàn tầng ngoài, không phải cơ chế chính.
+                results[fn] = future.result(timeout=30) or []
+            except Exception as e:
+                logger.warning(f"_fetch_funds_parallel: quỹ {fn} lỗi/timeout: {e}")
+                results[fn] = []
+        return results
+    finally:
+        executor.shutdown(wait=False)
+
 def _fetch_fund_holdings(fund_name):
     """
     Lấy top holding quỹ mở, 4 lớp fallback theo thứ tự, dừng ở lớp đầu tiên thành công:
-      1. vnstock (Reference → Market), retry tối đa 2 lần, backoff 1.5s/3s
-         (timeout mỗi request đã có sẵn trong vnstock.core.utils.client.send_request, mặc định 30s)
-      2. Gọi thẳng fmarket.vn (_fmarket_direct_top_holding) — độc lập với bug wrapper vnstock
+      1. vnstock (Reference → Market), timeout CỨNG 6s/nguồn qua _bounded_call, KHÔNG retry
+         (tối đa ~12s cho cả lớp — thay cho bản retry+backoff cũ có thể lên tới 360s/quỹ)
+      2. Gọi thẳng fmarket.vn (_fmarket_direct_top_holding), timeout 6s/request (tối đa ~12s)
       3. Cache cũ nhất từng thành công (_fund_holdings_last_good), bất kể đã hết TTL_FUND
       4. Snapshot tĩnh FUND_HOLDINGS_FALLBACK do người dùng tự cập nhật tay
-    Field "stale": true được thêm vào mỗi holding khi dữ liệu đến từ lớp 3 hoặc lớp 4,
-    để bot/AI biết dữ liệu có thể không còn mới nhất — các field cũ khác giữ nguyên.
+    Field "stale": true được thêm vào mỗi holding khi dữ liệu đến từ lớp 3 hoặc lớp 4.
     """
     key = f"fund_holdings_{fund_name}"
     cached = _cache_get(key)
@@ -278,30 +333,24 @@ def _fetch_fund_holdings(fund_name):
         _cache_set(key, result, TTL_FUND)
         _fund_holdings_last_good[fund_name] = {"data": result, "ts": time.time()}
 
-    # ── Lớp 1: vnstock, retry tối đa 2 lần ──
-    delays = [1.5, 3]
-    last_err = None
-    for attempt in range(len(delays) + 1):
-        try:
-            data = Reference().fund(fund_name).top_holding()
-            result = _serialize(data)
-            if result:
-                _remember_success(result)
-                return result
-        except Exception as e:
-            last_err = e
-        try:
-            data = Market().fund(fund_name).top_holding()
-            result = _serialize(data)
-            if result:
-                _remember_success(result)
-                return result
-        except Exception as e:
-            last_err = e
-        if attempt < len(delays):
-            logger.warning(f"_fetch_fund_holdings({fund_name}) lớp 1 lỗi (lần {attempt+1}/{len(delays)+1}): {last_err} — thử lại sau {delays[attempt]}s")
-            time.sleep(delays[attempt])
-    logger.warning(f"_fetch_fund_holdings({fund_name}) — lớp 1 (vnstock) thất bại sau {len(delays)+1} lần thử: {last_err}")
+    # ── Lớp 1: vnstock, timeout cứng 6s/nguồn, KHÔNG retry/sleep ──
+    def _via_reference():
+        return _serialize(Reference().fund(fund_name).top_holding())
+
+    def _via_market():
+        return _serialize(Market().fund(fund_name).top_holding())
+
+    result = _bounded_call(_via_reference, hard_timeout=6)
+    if result:
+        _remember_success(result)
+        return result
+
+    result = _bounded_call(_via_market, hard_timeout=6)
+    if result:
+        _remember_success(result)
+        return result
+
+    logger.warning(f"_fetch_fund_holdings({fund_name}) — lớp 1 (vnstock) thất bại/timeout (Reference + Market, 6s/nguồn)")
 
     # ── Lớp 2: gọi thẳng fmarket.vn ──
     try:
@@ -577,13 +626,13 @@ def get_fund_industry(symbol: str):
 
 @app.get("/fund-favorites")
 def get_fund_favorites():
-    result = {}
-    for fund_name in ["DCDS", "DCDE"]:
-        try:
-            holdings = _fetch_fund_holdings(fund_name)
-            result[fund_name] = holdings[:10] if isinstance(holdings, list) else []
-        except Exception:
-            result[fund_name] = []
+    def _run():
+        holdings_map = _fetch_funds_parallel(["DCDS", "DCDE"])
+        return {fn: (h[:10] if isinstance(h, list) else []) for fn, h in holdings_map.items()}
+    result = _bounded_call(_run, hard_timeout=20)
+    if result is None:
+        logger.error("/fund-favorites — vượt timeout cứng 20s ở tầng endpoint, trả rỗng để tránh treo Render/GAS")
+        return {"DCDS": [], "DCDE": []}
     return result
 
 # ===== KIỂM TRA QUỸ NẮM GIỮ =====
@@ -925,9 +974,10 @@ def get_index(symbol: str):
 def get_growth_stocks():
     candidates = []
     seen = set()
+    holdings_map = _fetch_funds_parallel(["DCDS", "DCDE", "DCBF"])
     for fund_name in ["DCDS", "DCDE", "DCBF"]:
         try:
-            holdings = _fetch_fund_holdings(fund_name)
+            holdings = holdings_map.get(fund_name) or []
             for row in holdings:
                 sym = str(row.get("stock_code") or row.get("symbol") or "").upper()
                 if not sym or sym in seen:
@@ -956,9 +1006,10 @@ def get_growth_stocks():
 def get_dividend_kings():
     candidates = []
     seen = set()
+    holdings_map = _fetch_funds_parallel(["DCDS", "DCDE", "DCBF"])
     for fund_name in ["DCDS", "DCDE", "DCBF"]:
         try:
-            holdings = _fetch_fund_holdings(fund_name)
+            holdings = holdings_map.get(fund_name) or []
             for row in holdings:
                 sym = str(row.get("stock_code") or row.get("symbol") or "").upper()
                 if not sym or sym in seen:
