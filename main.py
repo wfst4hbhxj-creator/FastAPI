@@ -379,6 +379,112 @@ def _fetch_fund_holdings(fund_name):
     logger.error(f"❌ _fetch_fund_holdings({fund_name}) — cả 4 lớp đều không có dữ liệu.")
     return []
 
+# =====================================
+# 🩺 CHẨN ĐOÁN fund-holdings — CHỈ phục vụ /debug/fund-holdings, KHÔNG dùng bởi bot/endpoint khác.
+# Chạy ĐỘC LẬP với _fetch_fund_holdings() ở trên (không sửa/gọi lại hàm đó): chạy đủ CẢ 4 lớp
+# bất kể lớp trước có thành công hay không, để đo được chính xác thời gian + lỗi của TỪNG lớp.
+# KHÔNG ghi vào _cache/_fund_holdings_last_good — thuần túy chỉ quan sát, không có side-effect
+# lên hành vi production của _fetch_fund_holdings().
+# =====================================
+def _bounded_call_diag(fn, args=(), kwargs=None, hard_timeout=6):
+    """
+    Biến thể của _bounded_call() CHỈ dùng cho /debug/fund-holdings — cùng cơ chế timeout cứng
+    (executor thủ công, KHÔNG dùng `with`, shutdown(wait=False) trong finally), nhưng trả về
+    (result, error_str) thay vì nuốt lỗi thành None, để endpoint chẩn đoán lấy được str(exception)
+    THẬT thay vì thông báo chung chung. Không thay _bounded_call() gốc để không ảnh hưởng các
+    nơi khác đang dùng nó (_fetch_fund_holdings, _fetch_funds_parallel, /fund-favorites...).
+    """
+    kwargs = kwargs or {}
+    executor = ThreadPoolExecutor(max_workers=1)
+    try:
+        future = executor.submit(fn, *args, **kwargs)
+        return future.result(timeout=hard_timeout), None
+    except FutureTimeoutError:
+        return None, f"Timeout sau {hard_timeout}s"
+    except Exception as e:
+        return None, str(e)
+    finally:
+        executor.shutdown(wait=False)
+
+def _diagnose_fund_holdings(fund_name):
+    layer_errors = {"layer1": None, "layer2": None, "layer3": None, "layer4": None}
+    layer_durations = {}
+    layer_used = None
+    total_start = time.time()
+
+    # Lớp 1: vnstock, timeout cứng 6s/nguồn — cùng cấu hình với production, nhưng dùng
+    # _bounded_call_diag để lấy được str(exception) thật của cả Reference lẫn Market
+    t = time.time()
+    layer1_result = None
+    err_ref = err_mkt = None
+    try:
+        def _via_reference():
+            return _serialize(Reference().fund(fund_name).top_holding())
+        r, err_ref = _bounded_call_diag(_via_reference, hard_timeout=6)
+        if not r:
+            def _via_market():
+                return _serialize(Market().fund(fund_name).top_holding())
+            r, err_mkt = _bounded_call_diag(_via_market, hard_timeout=6)
+        layer1_result = r
+        if not layer1_result:
+            layer_errors["layer1"] = f"Reference: {err_ref or 'rỗng, không lỗi cụ thể'} | Market: {err_mkt or 'rỗng, không lỗi cụ thể'}"
+    except Exception as e:
+        layer_errors["layer1"] = str(e)
+    layer_durations["layer1"] = round(time.time() - t, 2)
+    if layer1_result and layer_used is None:
+        layer_used = "layer1"
+
+    # Lớp 2: fmarket.vn trực tiếp
+    t = time.time()
+    layer2_result = None
+    try:
+        layer2_result = _fmarket_direct_top_holding(fund_name)
+    except Exception as e:
+        layer_errors["layer2"] = str(e)
+    layer_durations["layer2"] = round(time.time() - t, 2)
+    if layer2_result and layer_used is None:
+        layer_used = "layer2"
+
+    # Lớp 3: cache cũ — CHỈ ĐỌC, không ghi
+    t = time.time()
+    stale = _fund_holdings_last_good.get(fund_name)
+    if not stale:
+        layer_errors["layer3"] = "Chưa từng có cache thành công nào (_fund_holdings_last_good rỗng cho quỹ này)"
+    layer_durations["layer3"] = round(time.time() - t, 3)
+    if stale and layer_used is None:
+        layer_used = "layer3"
+
+    # Lớp 4: snapshot tĩnh — CHỈ ĐỌC
+    t = time.time()
+    fallback = FUND_HOLDINGS_FALLBACK.get(fund_name.upper()) or []
+    if not fallback:
+        layer_errors["layer4"] = "FUND_HOLDINGS_FALLBACK rỗng cho quỹ này — người dùng chưa tự điền tay"
+    layer_durations["layer4"] = round(time.time() - t, 3)
+    if fallback and layer_used is None:
+        layer_used = "layer4"
+
+    return {
+        "layer_used": layer_used,  # None nếu CẢ 4 lớp đều không có dữ liệu
+        "duration_sec": round(time.time() - total_start, 2),
+        "layer_errors": layer_errors,
+        "layer_durations_sec": layer_durations,
+    }
+
+@app.get("/debug/fund-holdings")
+def debug_fund_holdings():
+    """
+    Endpoint CHẨN ĐOÁN THẬT — KHÔNG cache, luôn chạy live (chạy đủ 4 lớp cho cả DCDS/DCDE
+    dù lớp nào thành công trước), mục đích DUY NHẤT là để người dùng tự curl lấy bằng chứng
+    thật khi /recommend còn lỗi. KHÔNG được bot/endpoint nào khác gọi tới.
+    """
+    result = {}
+    for fund_name in ["DCDS", "DCDE"]:
+        try:
+            result[fund_name] = _diagnose_fund_holdings(fund_name)
+        except Exception as e:
+            result[fund_name] = {"error": f"Lỗi chẩn đoán: {e}"}
+    return result
+
 # ===== META =====
 
 @app.get("/")

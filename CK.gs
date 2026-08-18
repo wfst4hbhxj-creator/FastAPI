@@ -1,7 +1,7 @@
 // =====================================
 // 🔐 THÔNG TIN CẤU HÌNH — KHÔNG THAY ĐỔI
 // =====================================
-const TELEGRAM_TOKEN   = '8545515587:AAF6uC6kvliAgGrP3gSuTDtc3XxPJMjZXDg';
+const TELEGRAM_TOKEN   = '8894874144:AAGqgBek0s6fc-wClNGtkkq6FLNvX2ve6G4';
 const TELEGRAM_URL     = "https://api.telegram.org/bot" + TELEGRAM_TOKEN;
 const ADMIN_CHAT_ID    = '1538608902';
 
@@ -17,16 +17,19 @@ const API_BASE = "https://vnstockapi.containers.snapdeploy.app";
 // =====================================
 const DS2API_BASE_URL = 'PASTE_DS2API_BASE_URL';
 const DS2API_KEY      = 'PASTE_DS2API_KEY';
-// Model non-thinking để tránh trễ phản hồi webhook GAS. Đổi sang
-// "deepseek-v4-flash-nothinking" nếu muốn tắt search.
-const DS2API_MODEL_SEARCH = 'deepseek-v4-flash-search-nothinking';
-const DS2API_MODEL_NOTHINKING = 'deepseek-v4-flash-nothinking';
+// Model CÓ search — chậm hơn đáng kể, CHỈ dùng cho tác vụ thực sự cần tìm tin tức mới
+// ngoài dữ liệu bot đã cung cấp (vd /news, tổng hợp tin vĩ mô, phân tích 1 mã có tin tức).
+const DS2API_MODEL_SEARCH   = 'deepseek-v4-flash-search-nothinking';
+// Model KHÔNG search — nhanh & ổn định hơn, dùng làm MẶC ĐỊNH cho các tác vụ chỉ suy luận/
+// so sánh/xếp hạng/giải thích trên số liệu bot đã tính sẵn (vd /compare, /hold phân tích).
+const DS2API_MODEL_NOSEARCH = 'deepseek-v4-flash-nothinking';
 
-function callAI(promptText, useSearch = false) {
+function callAI(promptText, useSearch) {
+  useSearch = !!useSearch; // mặc định false nếu không truyền
   if (!DS2API_KEY || DS2API_KEY.startsWith('PASTE_')) return null;
   if (!DS2API_BASE_URL || DS2API_BASE_URL.startsWith('PASTE_')) return null;
+  const model = useSearch ? DS2API_MODEL_SEARCH : DS2API_MODEL_NOSEARCH;
   try {
-    const model = useSearch ? DS2API_MODEL_SEARCH : DS2API_MODEL_NOTHINKING;
     const res = UrlFetchApp.fetch(DS2API_BASE_URL + "/v1/chat/completions", {
       method:"post",
       contentType:"application/json",
@@ -39,15 +42,17 @@ function callAI(promptText, useSearch = false) {
         ],
         temperature:0.1, max_tokens:1500, stream:false
       }),
+      // timeout 55s — dưới maxDuration:60 của ds2api trên Vercel Hobby, và dưới giới hạn
+      // nền tảng của UrlFetchApp (Apps Script không cho kéo dài hơn dù truyền số lớn hơn)
       muteHttpExceptions:true, timeout:55
     });
     if (res.getResponseCode()===200) {
       const text = JSON.parse(res.getContentText())?.choices?.[0]?.message?.content;
       if (text && text.trim().length>10) return text.trim();
     } else {
-      Logger.log("callAI HTTP "+res.getResponseCode()+": "+res.getContentText().substring(0,200));
+      Logger.log("callAI HTTP "+res.getResponseCode()+" (model="+model+"): "+res.getContentText().substring(0,200));
     }
-  } catch(e) { Logger.log("callAI: "+e); }
+  } catch(e) { Logger.log("callAI (model="+model+"): "+e); }
   return null;
 }
 
@@ -469,7 +474,7 @@ function analyzePortfolioAsync() {
   }
   sendLongMsg(chatId,lines.join("\n"));
   if(aiInputs.length){
-    const aiText=callAI("Danh mục NGẮN HẠN (điểm vào/TP/SL kỹ thuật đã tính sẵn, CL=điểm chất lượng/100):\n"+aiInputs.join("\n")+"\n\nVới từng mã, tìm TIN TỨC mới nhất, đưa ra:\n1. HÀNH ĐỘNG cụ thể: MUA THÊM / NẮM GIỮ / BÁN BỚT / BÁN HẾT\n2. Lý do 1-2 câu (kỹ thuật + chất lượng DN + tin tức)\n3. Nếu MUA THÊM: gom tại giá nào?\n4. Nếu CHỐT: chốt tại giá nào?\nTiếng Việt có dấu, ngắn gọn.");
+    const aiText=callAI("Danh mục NGẮN HẠN (điểm vào/TP/SL kỹ thuật đã tính sẵn, CL=điểm chất lượng/100):\n"+aiInputs.join("\n")+"\n\nVới từng mã, tìm TIN TỨC mới nhất, đưa ra:\n1. HÀNH ĐỘNG cụ thể: MUA THÊM / NẮM GIỮ / BÁN BỚT / BÁN HẾT\n2. Lý do 1-2 câu (kỹ thuật + chất lượng DN + tin tức)\n3. Nếu MUA THÊM: gom tại giá nào?\n4. Nếu CHỐT: chốt tại giá nào?\nTiếng Việt có dấu, ngắn gọn.", true);
     sendLongMsg(chatId,"🤖 KHUYẾN NGHỊ AI CHO TỪNG MÃ\n─────────────────────────\n"+(cleanAIText(aiText)||"AI đang bận."));
   }
   triggerNextInChain(chatId,"PORTFOLIO");
@@ -577,7 +582,7 @@ function analyzeStockAsync() {
   }
   sendLongMsg(chatId,lines.join("\n"));
   if(!aiInputs.length) return;
-  const aiText=callAI("Watchlist:\n"+aiInputs.join("\n")+"\n\nTìm tin tức mới nhất từng mã và viết:\n1. HÀNH ĐỘNG: MUA / CHỜ / QUAN SÁT\n2. Lý do 1-2 câu: kỹ thuật + tin tức\n3. Rủi ro chính cần chú ý\nTiếng Việt có dấu, ngắn gọn.");
+  const aiText=callAI("Watchlist:\n"+aiInputs.join("\n")+"\n\nTìm tin tức mới nhất từng mã và viết:\n1. HÀNH ĐỘNG: MUA / CHỜ / QUAN SÁT\n2. Lý do 1-2 câu: kỹ thuật + tin tức\n3. Rủi ro chính cần chú ý\nTiếng Việt có dấu, ngắn gọn.", true);
   sendLongMsg(chatId,"🤖 PHÂN TÍCH AI — WATCHLIST\n─────────────────────────\n"+(cleanAIText(aiText)||"AI đang bận."));
 }
 
@@ -745,7 +750,7 @@ function holdCompareAsync() {
     sendLongMsg(chatId,lines.join("\n"));
 
     const aiCtx=rows.map(r=>r.sym+"="+r.score+"đ("+r.rating+")").join(", ");
-    const aiText=callAI("So sánh tích sản dài hạn các mã: "+aiCtx+". Mã điểm cao nhất là "+rows[0].sym+". Giải thích ngắn gọn (2-3 câu) vì sao "+rows[0].sym+" là lựa chọn tốt nhất để tích sản dài hạn trong nhóm này, dựa trên các điểm số đã cho. Tiếng Việt có dấu, không chèn link, không tự tính lại điểm.");
+    const aiText=callAI("So sánh tích sản dài hạn các mã: "+aiCtx+". Mã điểm cao nhất là "+rows[0].sym+". Giải thích ngắn gọn (2-3 câu) vì sao "+rows[0].sym+" là lựa chọn tốt nhất để tích sản dài hạn trong nhóm này, dựa trên các điểm số đã cho. Tiếng Việt có dấu, không chèn link, không tự tính lại điểm.");  // useSearch=false (mặc định) — chỉ diễn giải điểm đã tính, không cần search
     if(aiText) sendMsg(chatId,"🤖 "+(cleanAIText(aiText)||""));
     return;
   }
@@ -789,7 +794,7 @@ function holdCompareAsync() {
 
   const aiCtx=alloc.filter(a=>a.priceK).map(a=>a.sym+"="+a.qty+"cổ("+a.score+"đ)").join(", ");
   if(aiCtx){
-    const aiText=callAI("Phân bổ vốn tích sản dài hạn theo điểm chất lượng (đã tính sẵn bằng code, KHÔNG thay đổi số liệu): "+aiCtx+". Giải thích ngắn gọn (2-3 câu) cơ sở của cách phân bổ này và lưu ý rủi ro. Tiếng Việt có dấu, không chèn link.");
+    const aiText=callAI("Phân bổ vốn tích sản dài hạn theo điểm chất lượng (đã tính sẵn bằng code, KHÔNG thay đổi số liệu): "+aiCtx+". Giải thích ngắn gọn (2-3 câu) cơ sở của cách phân bổ này và lưu ý rủi ro. Tiếng Việt có dấu, không chèn link.");  // useSearch=false (mặc định) — chỉ diễn giải phân bổ đã tính
     if(aiText) sendMsg(chatId,"🤖 "+(cleanAIText(aiText)||""));
   }
 }
@@ -851,7 +856,7 @@ function holdScanAsync() {
     // Bổ sung AI nếu chưa đủ 10
     if(merged.length<10){
       sendMsg(chatId,"⏳ Đang nhờ AI bổ sung mã tích sản...");
-      const aiText=callAI("Bạn là chuyên gia đầu tư giá trị (tích sản). Tìm kiếm trên internet các cổ phiếu Việt Nam (HOSE, HNX, UPCOM) có lợi nhuận tăng trưởng mạnh nhất, chia cổ tức đều đặn và có tin tức tốt nhất hiện tại.\nCHỈ TRẢ VỀ DUY NHẤT một mảng JSON chứa 10 mã. Ví dụ: [FPT,HPG,SSI]. Tuyệt đối KHÔNG kèm văn bản giải thích.");
+      const aiText=callAI("Bạn là chuyên gia đầu tư giá trị (tích sản). Tìm kiếm trên internet các cổ phiếu Việt Nam (HOSE, HNX, UPCOM) có lợi nhuận tăng trưởng mạnh nhất, chia cổ tức đều đặn và có tin tức tốt nhất hiện tại.\nCHỈ TRẢ VỀ DUY NHẤT một mảng JSON chứa 10 mã. Ví dụ: [FPT,HPG,SSI]. Tuyệt đối KHÔNG kèm văn bản giải thích.", true);
       if(aiText){
         let aiSyms=[];
         try{const m=aiText.match(/\[.*?\]/s);if(m)aiSyms=JSON.parse(m[0].replace(/([A-Z]{2,4})/g,'"$1"'));}catch(e){}
@@ -946,7 +951,7 @@ function holdScanAsync() {
   sendLongMsg(chatId,lines.join("\n"));
 
   const top5=candidates.slice(0,5).map(c=>c.sym+"(điểm="+c.apiScore+" giá="+c.cur.toFixed(2)+" tang1Y="+c.growth1y+"% GT="+c.val+"tỷ nguon="+c.source+")").join(", ");
-  const aiFinalText=callAI("Bối cảnh: Nhà đầu tư muốn tích sản dài hạn 5-10 năm:\n• Cổ tức tiền mặt, năm sau cao hơn năm trước\n• Doanh thu/lợi nhuận tăng đều hàng năm\n• KHÔNG dùng margin\n• DCA khi giá chỉnh\n\nCác cổ phiếu: "+top5+"\n\nTìm tin tức và báo cáo tài chính mới nhất:\n1. Chọn DUY NHẤT 1 mã tốt nhất\n2. Lịch sử cổ tức 3-5 năm (có tăng đều không?)\n3. P/E, P/B, ROE — đang rẻ hay đắt?\n4. Giá kỳ vọng: 3 năm / 5 năm / 10 năm\n5. Chiến lược DCA: mua lần đầu khi nào, khi nào mua thêm\n6. Rủi ro dài hạn\nGợi ý: /hold [MÃ] [GIÁ] [SỐ_CỔ]\nTiếng Việt có dấu, ngắn gọn.");
+  const aiFinalText=callAI("Bối cảnh: Nhà đầu tư muốn tích sản dài hạn 5-10 năm:\n• Cổ tức tiền mặt, năm sau cao hơn năm trước\n• Doanh thu/lợi nhuận tăng đều hàng năm\n• KHÔNG dùng margin\n• DCA khi giá chỉnh\n\nCác cổ phiếu: "+top5+"\n\nTìm tin tức và báo cáo tài chính mới nhất:\n1. Chọn DUY NHẤT 1 mã tốt nhất\n2. Lịch sử cổ tức 3-5 năm (có tăng đều không?)\n3. P/E, P/B, ROE — đang rẻ hay đắt?\n4. Giá kỳ vọng: 3 năm / 5 năm / 10 năm\n5. Chiến lược DCA: mua lần đầu khi nào, khi nào mua thêm\n6. Rủi ro dài hạn\nGợi ý: /hold [MÃ] [GIÁ] [SỐ_CỔ]\nTiếng Việt có dấu, ngắn gọn.", true);
   sendLongMsg(chatId,"🌱 AI CHỌN MÃ TÍCH SẢN\n─────────────────────────────\n"+(cleanAIText(aiFinalText)||"AI đang bận. Dùng /hold [MÃ] để phân tích chi tiết."));
 }
 
@@ -1029,7 +1034,7 @@ function analyzeHoldAsync() {
   });
   sendLongMsg(chatId,lines.join("\n"));
   if(aiInputs.length){
-    const aiText=callAI("Danh sách TÍCH SẢN DÀI HẠN (chiến lược 10 năm, không dùng margin):\n"+aiInputs.join("\n")+"\n\nVới từng mã, tìm TIN TỨC + BÁO CÁO TÀI CHÍNH mới nhất:\n1. HÀNH ĐỘNG: Mua thêm / Giữ / Chờ giá tốt / Cân nhắc thoát\n2. GIÁ MUA THÊM cụ thể\n3. Cổ tức gần nhất — xu hướng tăng hay giảm?\n4. Rủi ro dài hạn\nTiếng Việt có dấu, ngắn gọn.");
+    const aiText=callAI("Danh sách TÍCH SẢN DÀI HẠN (chiến lược 10 năm, không dùng margin):\n"+aiInputs.join("\n")+"\n\nVới từng mã, tìm TIN TỨC + BÁO CÁO TÀI CHÍNH mới nhất:\n1. HÀNH ĐỘNG: Mua thêm / Giữ / Chờ giá tốt / Cân nhắc thoát\n2. GIÁ MUA THÊM cụ thể\n3. Cổ tức gần nhất — xu hướng tăng hay giảm?\n4. Rủi ro dài hạn\nTiếng Việt có dấu, ngắn gọn.", true);
     sendLongMsg(chatId,"🤖 PHÂN TÍCH TÍCH SẢN\n─────────────────────────\n"+(cleanAIText(aiText)||"AI đang bận."));
   }
   triggerNextInChain(chatId,"HOLD");
@@ -1115,7 +1120,7 @@ function analyzeValueSingle(chatId, symbol) {
       "6. Giá kỳ vọng: 3 năm / 5 năm / 10 năm\n"+
       "7. Chiến lược: Giá nào thì bắt đầu gom?\n\n"+
       "Nếu đáng: gợi ý /hold "+symbol+" [GIA] [SO_CO]\nTiếng Việt có dấu, ngắn gọn.";
-    const aiText=callAI(prompt);
+    const aiText=callAI(prompt, true); // "Tìm kiếm tin tức mới nhất" trong prompt — cần search
     sendLongMsg(chatId,"🤖 PHÂN TÍCH AI — TÍCH SẢN\n─────────────────────────\n"+(cleanAIText(aiText)||"AI đang bận."));
   }catch(e){sendMsg(chatId,"❌ Lỗi: "+e.message);}
 }
@@ -1307,6 +1312,56 @@ function fetchWorldMarket() {
 }
 
 // =====================================
+// 🏷 GẮN MÃ HƯỞNG LỢI/BỊ HẠI VÀO TIN TỨC
+// Dùng AI CHỈ để diễn giải/gắn nhãn văn bản — KHÔNG dùng để tính điểm hay quyết định mua/bán.
+// =====================================
+function tagNewsWithSymbols(rssNews) {
+  const news = rssNews.slice(0, 8);
+  if (!news.length) return [];
+  const promptLines = news.map((n,i)=> (i+1)+". "+n.title);
+  const prompt =
+    "Dưới đây là "+news.length+" tiêu đề tin tức chứng khoán Việt Nam:\n"+
+    promptLines.join("\n")+"\n\n"+
+    "Với MỖI tin, xác định các mã cổ phiếu HOSE/HNX/UPCOM CÓ THẬT (không bịa mã) sẽ hưởng lợi (LOI) "+
+    "hay bị hại (HAI) từ tin đó, tối đa 3 mã/tin. Nếu tin không rõ ràng liên quan mã cụ thể nào, "+
+    "trả TRUNGLAP không kèm mã.\n\n"+
+    "CHỈ trả lời theo ĐÚNG format máy đọc được, mỗi dòng 1 tin theo đúng thứ tự trên, KHÔNG thêm giải thích:\n"+
+    "<số>: <LOI|HAI|TRUNGLAP> <mã1>,<mã2>,...\n"+
+    "Ví dụ:\n1: LOI SSI,VND,HCM\n2: HAI DIG\n3: TRUNGLAP";
+  try {
+    // useSearch=false — chỉ suy luận trên tiêu đề đã cho, không cần tìm thêm tin tức mới
+    const raw = callAI(prompt, false);
+    if (!raw) return [];
+    return parseNewsTagResponse(raw, news.length);
+  } catch(e) {
+    Logger.log("tagNewsWithSymbols: "+e);
+    return [];
+  }
+}
+
+// Parse "<số>: <LOI|HAI|TRUNGLAP> <mã1>,<mã2>,..." theo từng dòng.
+// Dòng nào không khớp/thiếu → mặc định TRUNGLAP (không gắn tag) — 1 dòng lỗi KHÔNG được crash cả hàm.
+function parseNewsTagResponse(text, expectedCount) {
+  const result = [];
+  for (let i=0;i<expectedCount;i++) result.push({tag:"TRUNGLAP", symbols:[]});
+  try {
+    const lines = String(text).split("\n");
+    lines.forEach(line=>{
+      try {
+        const m = line.trim().match(/^(\d+):\s*(LOI|HAI|TRUNGLAP)\s*([A-Z,]*)$/);
+        if (!m) return; // dòng không khớp format — bỏ qua, giữ mặc định TRUNGLAP
+        const idx = parseInt(m[1],10)-1;
+        if (idx<0 || idx>=expectedCount) return;
+        const tag = m[2];
+        const symbols = (m[3]||"").split(",").map(s=>s.trim()).filter(s=>/^[A-Z]{2,4}$/.test(s)).slice(0,3);
+        result[idx] = (tag!=="TRUNGLAP" && symbols.length) ? {tag, symbols} : {tag:"TRUNGLAP", symbols:[]};
+      } catch(e) { /* 1 dòng lỗi không được làm hỏng cả hàm */ }
+    });
+  } catch(e) { Logger.log("parseNewsTagResponse: "+e); }
+  return result;
+}
+
+// =====================================
 // 📰 LẤY TIN TỨC RSS — CafeF + VnEconomy
 // =====================================
 function fetchNewsRSS() {
@@ -1397,8 +1452,16 @@ function buildMarketContext() {
   // 3. Tin tức trong nước
   if(rssNews.length>0){
     lines.push("=== TIN TỨC CHỨNG KHOÁN TRONG NƯỚC ===");
+    // Gắn mã hưởng lợi/bị hại — bọc try/catch riêng: lỗi/timeout KHÔNG được làm hỏng
+    // phần macro/chỉ số đã lấy thành công ở trên. Nếu lỗi, hiển thị tin KHÔNG có tag (như cũ).
+    let newsTags = [];
+    try { newsTags = tagNewsWithSymbols(rssNews); } catch(e) { Logger.log("buildMarketContext tagNewsWithSymbols: "+e); newsTags = []; }
     rssNews.slice(0,8).forEach((n,i)=>{
-      lines.push((i+1)+". ["+n.source+"] "+n.title);
+      let suffix = "";
+      const t = newsTags[i];
+      if (t && t.tag==="LOI" && t.symbols && t.symbols.length) suffix = " → 📈 Có lợi: "+t.symbols.join(", ");
+      else if (t && t.tag==="HAI" && t.symbols && t.symbols.length) suffix = " → 📉 Có hại: "+t.symbols.join(", ");
+      lines.push((i+1)+". ["+n.source+"] "+n.title+suffix);
     });
   }
 
@@ -1454,7 +1517,8 @@ function runDailyReport(targetChatId) {
       "3. Chọn 20 mã cổ phiếu Việt Nam (HOSE/HNX/UPCOM) có tiềm năng nhất hôm nay,"+
       " kết hợp: tin tức hỗ trợ + ngành hưởng lợi + dòng tiền\n\n"+
       "QUAN TRỌNG: Cuối cùng CHỈ trả về JSON array 20 mã, ví dụ: [HPG,SSI,FPT]\n"+
-      "Format:\nNHẬN ĐỊNH: [2-3 câu macro]\nNGÀNH HƯỞNG LỢI: [tên ngành]\nMÃ TIỀM NĂNG: [A,B,C,...]"
+      "Format:\nNHẬN ĐỊNH: [2-3 câu macro]\nNGÀNH HƯỞNG LỢI: [tên ngành]\nMÃ TIỀM NĂNG: [A,B,C,...]",
+      true // cần "tin tức hỗ trợ" ngoài dữ liệu macro đã cho — search
     );
     if(!aiPickText){sendMsg(targetChatId,"❌ AI đang bận.");markSent(targetChatId);return;}
 
@@ -1552,7 +1616,8 @@ function runDailyReport(targetChatId) {
     "(lặp lại cho Mã 2, Mã 3)\n\n"+
     "⚠ RỦI RO HÔM NAY: [1 câu rủi ro chính cần chú ý]\n"+
     "╚══════════════════════════════╝\n\n"+
-    "Tiếng Việt có dấu. Dùng đúng giá từ dữ liệu."
+    "Tiếng Việt có dấu. Dùng đúng giá từ dữ liệu.",
+    true // "Tìm tin tức mới nhất hỗ trợ từng mã" — cần search
   );
   const topSignals=cached.filter(x=>x.startsWith("• ")).slice(0,3);
   const fallback="╔══ BẢN TIN VIP — "+today2+" ══╗\n"+(macroCtx?"📊 NHẬN ĐỊNH: "+macroCtx.substring(0,150)+"\n\n":"")+"KHUYẾN NGHỊ: XEM CHI TIẾT\n\n"+topSignals.join("\n")+"\n\n⚠ AI đang bận. Gõ tên mã để soi chi tiết.\n╚══════════════════════════════╝";
@@ -1637,7 +1702,7 @@ function analyzeAndSend(chatId, symbol) {
     const newsCtx  = newsData&&newsData.length>0?" Tin gần đây: "+newsData.slice(0,2).map(n=>n.title||"").filter(Boolean).join("; ")+".":"";
 
     const prompt="Cổ phiếu "+symbol+" — giá: "+ind.cur.toFixed(2)+"\nSMA20="+ind.sma20.toFixed(2)+" SMA50="+ind.sma50.toFixed(2)+" RSI="+ind.rsi.toFixed(1)+" KL="+volTag+" xu hướng="+ind.trend+"\nVào="+ep.entry+" TP1="+ep.tp1+" TP2="+ep.tp2+" SL="+ep.sl+scoreCtx+fundCtx+newsCtx+"\n\nTìm tin tức mới nhất về "+symbol+" và viết 2-3 câu:\n1. Lý do kỹ thuật + chất lượng DN + tin tức ủng hộ "+ep.action+"\n2. Rủi ro cần chú ý\nKHÔNG đưa ra TP/SL khác. Tiếng Việt có dấu, ngắn gọn.";
-    const aiText=callAI(prompt);
+    const aiText=callAI(prompt, true); // "Tìm tin tức mới nhất về "+symbol — cần search
     sendLongMsg(chatId,"\n🤖 "+( cleanAIText(aiText)||"Hỗ trợ: "+ind.lo20.toFixed(2)+" | Kháng cự: "+ind.hi20.toFixed(2)));
   }catch(e){sendMsg(chatId,"❌ Lỗi: "+e.message);}
 }
@@ -1750,6 +1815,7 @@ function compareSymbolsAsync() {
   sendLongMsg(chatId,lines.join("\n"));
 
   if(!aiInputs.length) return;
+  // useSearch=false (mặc định) — xếp hạng dựa trên KT+CL đã tính sẵn, không cần search
   const aiText=callAI("So sánh:\n"+aiInputs.join("\n")+"\n\nTP/SL đã tính sẵn, KHÔNG thay đổi.\nTìm tin tức mới nhất từng mã:\n1. Xếp hạng từ tốt đến kém (tổng hợp KT + chất lượng DN)\n2. Mã #1: giải thích tại sao, rủi ro\n3. Mã còn lại: 1 câu\nTiếng Việt có dấu, ngắn gọn.");
   sendLongMsg(chatId,"🤖 PHÂN TÍCH AI — SO SÁNH "+syms.join(" vs ")+"\n─────────────────────────\n"+(cleanAIText(aiText)||"AI đang bận."));
 }
@@ -1778,7 +1844,7 @@ function handleNews(chatId, symbol) {
     });
     sendMsg(chatId,lines.join("\n"));
     // Luôn hỏi thêm AI để có nhận định
-    const aiText=callAI("Dựa trên tin tức cổ phiếu "+symbol+", hãy tìm thêm tin tức mới nhất và đưa ra nhận định ngắn gọn: Tích cực / Tiêu cực / Trung lập và lý do 1-2 câu. Tiếng Việt có dấu.");
+    const aiText=callAI("Dựa trên tin tức cổ phiếu "+symbol+", hãy tìm thêm tin tức mới nhất và đưa ra nhận định ngắn gọn: Tích cực / Tiêu cực / Trung lập và lý do 1-2 câu. Tiếng Việt có dấu.", true);
     if(aiText) sendMsg(chatId,"🤖 Nhận định AI: "+( cleanAIText(aiText)||""));
   } else {
     // API không có tin → dùng AI trực tiếp, không hiện thông báo lỗi API
@@ -1790,7 +1856,8 @@ function handleNews(chatId, symbol) {
       "2. [Tiêu đề tin] — [1 câu tóm tắt]\n"+
       "(liệt kê 5 tin quan trọng nhất)\n\n"+
       "Cuối cùng: Nhận định tổng: Tích cực / Tiêu cực / Trung lập và lý do.\n"+
-      "Tiếng Việt có dấu, ngắn gọn."
+      "Tiếng Việt có dấu, ngắn gọn.",
+      true
     );
     sendMsg(chatId,cleanAIText(aiText)||"Không tìm được tin tức cho "+symbol+" lúc này.");
   }
@@ -1898,7 +1965,8 @@ function recommendAsync() {
     "Tìm tin tức mới nhất về từng mã, với mỗi mã viết:\n" +
     "• 1 câu lý do nên theo dõi (catalyst, tin tức tốt)\n" +
     "• 1 câu rủi ro cần chú ý\n" +
-    "Tiếng Việt có dấu, ngắn gọn."
+    "Tiếng Việt có dấu, ngắn gọn.",
+    true
   );
   if(aiText) sendLongMsg(chatId, "🤖 NHẬN XÉT AI\n─────────────────────────\n" + cleanAIText(aiText));
 }
@@ -2075,7 +2143,9 @@ function handleAIStatus(chatId) {
   const urlOk  = DS2API_BASE_URL && !DS2API_BASE_URL.startsWith('PASTE_');
   const ok = keyOk && urlOk;
   let msg="🤖 Trạng thái AI\nProvider: DeepSeek (qua ds2api)\n─────────────────────────\n";
-  msg+=(ok?"🟢":"🔴")+" Model: "+DS2API_MODEL+"\n";
+  msg+=(ok?"🟢":"🔴")+" Model search: "+DS2API_MODEL_SEARCH+"\n";
+  msg+=(ok?"🟢":"🔴")+" Model không search: "+DS2API_MODEL_NOSEARCH+"\n";
+  msg+="Search mode: chỉ bật cho tác vụ cần tin tức mới (vd /news, tổng hợp macro) — các tác vụ so sánh/xếp hạng dùng model không search để nhanh & ổn định hơn.\n";
   msg+="Endpoint: "+(urlOk?DS2API_BASE_URL:"⚠️ chưa cấu hình DS2API_BASE_URL")+"\n";
   msg+="Key: "+(keyOk?"✅ đã cấu hình":"⚠️ chưa cấu hình DS2API_KEY")+"\n";
   msg+="\nds2api tự động xoay vòng nhiều tài khoản DeepSeek — bot không cần fallback thủ công.";
