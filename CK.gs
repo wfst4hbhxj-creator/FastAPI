@@ -19,18 +19,20 @@ const DS2API_BASE_URL = 'PASTE_DS2API_BASE_URL';
 const DS2API_KEY      = 'PASTE_DS2API_KEY';
 // Model non-thinking để tránh trễ phản hồi webhook GAS. Đổi sang
 // "deepseek-v4-flash-nothinking" nếu muốn tắt search.
-const DS2API_MODEL    = 'deepseek-v4-flash-search-nothinking';
+const DS2API_MODEL_SEARCH = 'deepseek-v4-flash-search-nothinking';
+const DS2API_MODEL_NOTHINKING = 'deepseek-v4-flash-nothinking';
 
-function callAI(promptText) {
+function callAI(promptText, useSearch = false) {
   if (!DS2API_KEY || DS2API_KEY.startsWith('PASTE_')) return null;
   if (!DS2API_BASE_URL || DS2API_BASE_URL.startsWith('PASTE_')) return null;
   try {
+    const model = useSearch ? DS2API_MODEL_SEARCH : DS2API_MODEL_NOTHINKING;
     const res = UrlFetchApp.fetch(DS2API_BASE_URL + "/v1/chat/completions", {
       method:"post",
       contentType:"application/json",
       headers:{"Authorization":"Bearer "+DS2API_KEY},
       payload: JSON.stringify({
-        model: DS2API_MODEL,
+        model: model,
         messages:[
           {role:"system",content:"Bạn là chuyên gia phân tích chứng khoán Việt Nam. Trả lời bằng tiếng Việt CÓ DẤU. KHÔNG chèn link. Ngắn gọn."},
           {role:"user",content:promptText}
