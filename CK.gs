@@ -1,7 +1,7 @@
 // =====================================
 // 🔐 THÔNG TIN CẤU HÌNH — KHÔNG THAY ĐỔI
 // =====================================
-const TELEGRAM_TOKEN   = '8894874144:AAGqgBek0s6fc-wClNGtkkq6FLNvX2ve6G4';
+const TELEGRAM_TOKEN   = '8545515587:AAF6uC6kvliAgGrP3gSuTDtc3XxPJMjZXDg';
 const TELEGRAM_URL     = "https://api.telegram.org/bot" + TELEGRAM_TOKEN;
 const ADMIN_CHAT_ID    = '1538608902';
 
@@ -11,48 +11,80 @@ const ADMIN_CHAT_ID    = '1538608902';
 const API_BASE = "https://vnstockapi.containers.snapdeploy.app";
 
 // =====================================
-// 🤖 GỌI AI — DeepSeek qua ds2api (OpenAI-compatible)
-// ds2api TỰ ĐỘNG xoay vòng/fallback giữa các tài khoản DeepSeek đã cấu hình
-// sẵn trong config.json của ds2api — bot KHÔNG cần tự viết logic fallback.
+// 🤖 GỌI AI — 2 tầng: Gemini 2.5 Flash-Lite (chính) → gpt-oss-20b qua Groq (backup, free tier)
+// Đã tra giá thật (không đoán):
+//   - gemini-2.5-flash-lite: ~$0.1 input / $0.4 output mỗi 1M token, tối ưu độ trễ thấp
+//   - openai/gpt-oss-20b (Groq): ~$0.075 input / $0.30 output, ~1000 tok/s, free tier (không cần thẻ)
+// ⚠️ gemini-2.5-flash-lite NGỪNG HOẠT ĐỘNG từ 16/10/2026 (Gemini Developer API) — cần đổi
+// GEMINI_MODEL trước ngày này, xem thông báo deprecation chính thức của Google khi gần tới hạn.
 // =====================================
-const DS2API_BASE_URL = 'PASTE_DS2API_BASE_URL';
-const DS2API_KEY      = 'PASTE_DS2API_KEY';
-// Model CÓ search — chậm hơn đáng kể, CHỈ dùng cho tác vụ thực sự cần tìm tin tức mới
-// ngoài dữ liệu bot đã cung cấp (vd /news, tổng hợp tin vĩ mô, phân tích 1 mã có tin tức).
-const DS2API_MODEL_SEARCH   = 'deepseek-v4-flash-search-nothinking';
-// Model KHÔNG search — nhanh & ổn định hơn, dùng làm MẶC ĐỊNH cho các tác vụ chỉ suy luận/
-// so sánh/xếp hạng/giải thích trên số liệu bot đã tính sẵn (vd /compare, /hold phân tích).
-const DS2API_MODEL_NOSEARCH = 'deepseek-v4-flash-nothinking';
+const GEMINI_API_KEY = 'PASTE_GEMINI_API_KEY';
+const GROQ_API_KEY   = 'PASTE_GROQ_API_KEY';
+const GEMINI_MODEL   = 'gemini-2.5-flash-lite';
+const GROQ_MODEL     = 'openai/gpt-oss-20b';
 
 function callAI(promptText, useSearch) {
   useSearch = !!useSearch; // mặc định false nếu không truyền
-  if (!DS2API_KEY || DS2API_KEY.startsWith('PASTE_')) return null;
-  if (!DS2API_BASE_URL || DS2API_BASE_URL.startsWith('PASTE_')) return null;
-  const model = useSearch ? DS2API_MODEL_SEARCH : DS2API_MODEL_NOSEARCH;
-  try {
-    const res = UrlFetchApp.fetch(DS2API_BASE_URL + "/v1/chat/completions", {
-      method:"post",
-      contentType:"application/json",
-      headers:{"Authorization":"Bearer "+DS2API_KEY},
-      payload: JSON.stringify({
-        model: model,
-        messages:[
-          {role:"system",content:"Bạn là chuyên gia phân tích chứng khoán Việt Nam. Trả lời bằng tiếng Việt CÓ DẤU. KHÔNG chèn link. Ngắn gọn."},
-          {role:"user",content:promptText}
-        ],
-        temperature:0.1, max_tokens:1500, stream:false
-      }),
-      // timeout 55s — dưới maxDuration:60 của ds2api trên Vercel Hobby, và dưới giới hạn
-      // nền tảng của UrlFetchApp (Apps Script không cho kéo dài hơn dù truyền số lớn hơn)
-      muteHttpExceptions:true, timeout:55
-    });
-    if (res.getResponseCode()===200) {
-      const text = JSON.parse(res.getContentText())?.choices?.[0]?.message?.content;
-      if (text && text.trim().length>10) return text.trim();
-    } else {
-      Logger.log("callAI HTTP "+res.getResponseCode()+" (model="+model+"): "+res.getContentText().substring(0,200));
-    }
-  } catch(e) { Logger.log("callAI (model="+model+"): "+e); }
+  const systemPrompt = "Bạn là chuyên gia phân tích chứng khoán Việt Nam. Trả lời bằng tiếng Việt CÓ DẤU. KHÔNG chèn link. Ngắn gọn.";
+
+  // ── Tầng 1: Gemini 2.5 Flash-Lite ──
+  if (GEMINI_API_KEY && !GEMINI_API_KEY.startsWith('PASTE_')) {
+    try {
+      const body = {
+        contents: [{ parts: [{ text: promptText }] }],
+        systemInstruction: { parts: [{ text: systemPrompt }] },
+        generationConfig: { temperature: 0.1, maxOutputTokens: 1500 }
+      };
+      if (useSearch) body.tools = [{ google_search: {} }];
+      const res = UrlFetchApp.fetch(
+        "https://generativelanguage.googleapis.com/v1beta/models/" + GEMINI_MODEL + ":generateContent?key=" + GEMINI_API_KEY,
+        {
+          method: "post",
+          contentType: "application/json",
+          payload: JSON.stringify(body),
+          muteHttpExceptions: true,
+          timeout: 15 // ~15s theo yêu cầu — tổng tệ nhất 15+12=27s, an toàn hơn hẳn bản 3 tầng cũ
+        }
+      );
+      if (res.getResponseCode() === 200) {
+        const data = JSON.parse(res.getContentText());
+        const parts = (data && data.candidates && data.candidates[0] && data.candidates[0].content && data.candidates[0].content.parts) || [];
+        const text = parts.map(function(p){ return p.text || ""; }).join("").trim();
+        if (text && text.length > 10) return text;
+      } else {
+        Logger.log("callAI Gemini HTTP " + res.getResponseCode() + ": " + res.getContentText().substring(0, 200));
+      }
+    } catch (e) { Logger.log("callAI Gemini: " + e); }
+  }
+
+  // ── Tầng 2: gpt-oss-20b qua Groq (backup, free tier) ──
+  if (GROQ_API_KEY && !GROQ_API_KEY.startsWith('PASTE_')) {
+    try {
+      const res = UrlFetchApp.fetch("https://api.groq.com/openai/v1/chat/completions", {
+        method: "post",
+        contentType: "application/json",
+        headers: { "Authorization": "Bearer " + GROQ_API_KEY },
+        payload: JSON.stringify({
+          model: GROQ_MODEL,
+          messages: [
+            { role: "system", content: systemPrompt },
+            { role: "user", content: promptText }
+          ],
+          temperature: 0.1,
+          max_tokens: 1500,
+          reasoning_effort: "low"
+        }),
+        muteHttpExceptions: true,
+        timeout: 12 // ~12s theo yêu cầu
+      });
+      if (res.getResponseCode() === 200) {
+        const text = JSON.parse(res.getContentText())?.choices?.[0]?.message?.content;
+        if (text && text.trim().length > 10) return text.trim();
+      } else {
+        Logger.log("callAI Groq HTTP " + res.getResponseCode() + ": " + res.getContentText().substring(0, 200));
+      }
+    } catch (e) { Logger.log("callAI Groq: " + e); }
+  }
   return null;
 }
 
@@ -2056,8 +2088,8 @@ function doPost(e) {
         "/set2 15h30        — Chiều: chỉ phân tích danh mục/tích sản/watchlist (T2-T6)\n"+
         "/setgold 10h00     — Lịch báo giá vàng hàng ngày\n"+
         "/myschedule        — Xem lịch báo cáo tự động\n"+
-        "/aistatus          — Trạng thái AI (DeepSeek qua ds2api)\n"+
-        "/resetcache        — (Không còn cần thiết — ds2api tự xoay vòng)\n"+
+        "/aistatus          — Trạng thái AI (Gemini Flash-Lite → Groq gpt-oss-20b)\n"+
+        "/resetcache        — (Không cần thiết — không có cache quota để reset)\n"+
         "/forcescan         — Reset lock khi /scan bị treo\n"+
         "/inittrigger       — Tạo lại trigger lịch khi bị mất"
       );
@@ -2094,7 +2126,7 @@ function doPost(e) {
     else if(up==="/AISTATUS")           {handleAIStatus(chatId);}
     else if(up==="/INITTRIGGER")        {handleInitTriggerCmd(chatId);}
     else if(up==="/RESETCACHE"){
-      sendMsg(chatId,"ℹ️ Không cần reset thủ công nữa — AI hiện dùng DeepSeek qua ds2api, ds2api tự động xoay vòng tài khoản khi có lỗi/hết quota.\n👉 /aistatus để xem trạng thái hiện tại.");
+      sendMsg(chatId,"ℹ️ Không cần reset thủ công — AI hiện dùng Gemini 2.5 Flash-Lite (chính) → gpt-oss-20b qua Groq (backup), không có cơ chế quota-lock để reset.\n👉 /aistatus để xem trạng thái hiện tại.");
     }
     else if(up==="/SCAN"||up==="/FORCESCAN"){
       const props=PropertiesService.getScriptProperties();
@@ -2139,16 +2171,13 @@ function doPost(e) {
 // 📊 AI STATUS
 // =====================================
 function handleAIStatus(chatId) {
-  const keyOk  = DS2API_KEY && !DS2API_KEY.startsWith('PASTE_');
-  const urlOk  = DS2API_BASE_URL && !DS2API_BASE_URL.startsWith('PASTE_');
-  const ok = keyOk && urlOk;
-  let msg="🤖 Trạng thái AI\nProvider: DeepSeek (qua ds2api)\n─────────────────────────\n";
-  msg+=(ok?"🟢":"🔴")+" Model search: "+DS2API_MODEL_SEARCH+"\n";
-  msg+=(ok?"🟢":"🔴")+" Model không search: "+DS2API_MODEL_NOSEARCH+"\n";
-  msg+="Search mode: chỉ bật cho tác vụ cần tin tức mới (vd /news, tổng hợp macro) — các tác vụ so sánh/xếp hạng dùng model không search để nhanh & ổn định hơn.\n";
-  msg+="Endpoint: "+(urlOk?DS2API_BASE_URL:"⚠️ chưa cấu hình DS2API_BASE_URL")+"\n";
-  msg+="Key: "+(keyOk?"✅ đã cấu hình":"⚠️ chưa cấu hình DS2API_KEY")+"\n";
-  msg+="\nds2api tự động xoay vòng nhiều tài khoản DeepSeek — bot không cần fallback thủ công.";
+  const geminiOk = GEMINI_API_KEY && !GEMINI_API_KEY.startsWith('PASTE_');
+  const groqOk   = GROQ_API_KEY && !GROQ_API_KEY.startsWith('PASTE_');
+  let msg="🤖 Trạng thái AI\nProvider: Gemini 2.5 Flash-Lite → gpt-oss-20b (Groq, free tier)\n─────────────────────────\n";
+  msg+=(geminiOk?"🟢":"🔴")+" Tầng 1 (chính): "+GEMINI_MODEL+(geminiOk?"":" — ⚠️ chưa cấu hình GEMINI_API_KEY")+"\n";
+  msg+=(groqOk?"🟢":"🔴")+" Tầng 2 (backup): "+GROQ_MODEL+(groqOk?"":" — ⚠️ chưa cấu hình GROQ_API_KEY")+"\n";
+  msg+="Search mode: chỉ bật google_search cho tầng 1 khi tác vụ cần tin tức mới (vd /news, tổng hợp macro) — tầng 2 (Groq) không hỗ trợ search.\n";
+  msg+="\n⚠️ gemini-2.5-flash-lite ngừng hoạt động từ 16/10/2026 — cần đổi model trước hạn.";
   sendMsg(chatId,msg);
 }
 
@@ -2359,8 +2388,8 @@ function setupBotCommands() {
       {command:"set2",        description:"Chiều: chỉ phân tích danh mục/tích sản: /set2 15h30"},
       {command:"setgold",     description:"Lịch báo giá vàng hàng ngày: /setgold 10h00"},
       {command:"myschedule",  description:"Xem lịch báo cáo tự động"},
-      {command:"aistatus",    description:"Trạng thái AI đang dùng (DeepSeek qua ds2api)"},
-      {command:"resetcache",  description:"(Không còn cần thiết — ds2api tự xoay vòng tài khoản)"},
+      {command:"aistatus",    description:"Trạng thái AI đang dùng (Gemini Flash-Lite → Groq gpt-oss-20b)"},
+      {command:"resetcache",  description:"(Không cần thiết — không có cache quota để reset)"},
       {command:"forcescan",   description:"Reset lock khi /scan bị treo"},
       {command:"inittrigger", description:"Tạo lại trigger lịch khi bị mất sau deploy"}
     ]}),muteHttpExceptions:true
