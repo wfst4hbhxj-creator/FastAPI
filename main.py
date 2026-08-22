@@ -550,9 +550,7 @@ def get_stock_price(symbol: str):
     except Exception as e:
         logger.warning(f"/stock/{symbol} DNSE lookup lỗi, fallback vnstock: {e}")
     try:
-        def _fetch_equity():
-            return Market().equity(symbol).ohlcv(start=_days_ago(5), end=_today(), interval="1D")
-        quote = _bounded_vnstock_call(_fetch_equity, hard_timeout=8)
+        quote = Market().equity(symbol).ohlcv(start=_days_ago(5), end=_today(), interval="1D")
         if quote is None or quote.empty:
             return _err(f"Không có dữ liệu giá cho {symbol}", 404)
         latest = quote.iloc[-1]
@@ -573,9 +571,8 @@ def get_company(symbol: str):
     if cached is not None:
         return cached
     try:
-        def _fetch_company():
-            return Reference().company(symbol).overview()
-        data = _bounded_vnstock_call(_fetch_company, hard_timeout=10)
+        # Gọi trực tiếp với timeout dài hơn, không dùng thread pool để tránh crash vnstock
+        data = Reference().company(symbol).overview()
         if data is None or (hasattr(data, "empty") and data.empty):
             return _err(f"Không tìm thấy công ty {symbol}", 404)
         result = _serialize(data)
@@ -595,9 +592,7 @@ def get_dividend(symbol: str):
     if cached is not None:
         return cached
     try:
-        def _fetch_events():
-            return Reference().company(symbol).events()
-        events = _bounded_vnstock_call(_fetch_events, hard_timeout=8)
+        events = Reference().company(symbol).events()
         if events is not None and not events.empty:
             div_mask = events.apply(
                 lambda r: any(kw in str(r).lower() for kw in ["cổ tức","dividend","chi tra","cash"]),
@@ -611,9 +606,7 @@ def get_dividend(symbol: str):
     except Exception:
         pass
     try:
-        def _fetch_ratio():
-            return Fundamental().equity(symbol).ratio()
-        ratio = _bounded_vnstock_call(_fetch_ratio, hard_timeout=8)
+        ratio = Fundamental().equity(symbol).ratio()
         if ratio is not None and not ratio.empty:
             div_cols = [c for c in ratio.columns if "dividend" in str(c).lower() or "div" in str(c).lower()]
             if div_cols:
@@ -637,9 +630,7 @@ def get_financial_summary(symbol: str):
     if cached is not None:
         return cached
     try:
-        def _fetch_ratios():
-            return Fundamental().equity(symbol).ratio()
-        ratios = _bounded_vnstock_call(_fetch_ratios, hard_timeout=10)
+        ratios = Fundamental().equity(symbol).ratio()
         if ratios is None or ratios.empty:
             return _err(f"Không có dữ liệu tài chính cho {symbol}", 404)
 
@@ -706,9 +697,7 @@ def get_financial_summary(symbol: str):
 def get_etf(symbol: str):
     symbol = symbol.upper()
     try:
-        def _fetch_etf():
-            return Market().etf(symbol).ohlcv(start=_days_ago(30), end=_today())
-        data = _bounded_vnstock_call(_fetch_etf, hard_timeout=8)
+        data = Market().etf(symbol).ohlcv(start=_days_ago(30), end=_today())
         if data is None or data.empty:
             return _err(f"Không có dữ liệu ETF {symbol}", 404)
         return _serialize(data.tail(10))
@@ -721,13 +710,11 @@ def get_etf(symbol: str):
 def get_fund_nav(symbol: str):
     symbol = symbol.upper()
     try:
-        def _fetch_nav():
-            mkt = Market()
-            try:
-                return mkt.fund(symbol).nav()
-            except Exception:
-                return mkt.fund(symbol).history()
-        nav = _bounded_vnstock_call(_fetch_nav, hard_timeout=8)
+        mkt = Market()
+        try:
+            nav = mkt.fund(symbol).nav()
+        except Exception:
+            nav = mkt.fund(symbol).history()
         if nav is None or nav.empty:
             return _err(f"Không có dữ liệu NAV cho quỹ {symbol}", 404)
         return _serialize(nav.tail(20))
@@ -749,12 +736,10 @@ def get_fund_top_holdings(symbol: str):
 def get_fund_industry(symbol: str):
     symbol = symbol.upper()
     try:
-        def _fetch_industry():
-            try:
-                return Reference().fund(symbol).industry_holding()
-            except Exception:
-                return Market().fund(symbol).industry_holding()
-        data = _bounded_vnstock_call(_fetch_industry, hard_timeout=8)
+        try:
+            data = Reference().fund(symbol).industry_holding()
+        except Exception:
+            data = Market().fund(symbol).industry_holding()
         if data is None or data.empty:
             return _err(f"Không có dữ liệu phân bổ ngành cho quỹ {symbol}", 404)
         return _serialize(data)
@@ -923,9 +908,8 @@ def get_hold(symbol: str):
             pass
         events_data = None
         try:
-            def _fetch_events():
-                return Reference().company(symbol).events()
-            ev = _bounded_vnstock_call(_fetch_events, hard_timeout=8)
+            # Gọi trực tiếp, không dùng thread pool
+            ev = Reference().company(symbol).events()
             if ev is not None and not ev.empty:
                 events_data = _serialize(ev.head(5))
         except Exception:
@@ -1006,9 +990,7 @@ def get_market():
     for key, idx in indices.items():
         for attempt_idx in ([idx] + (["HNX"] if key == "hnx" else []) + (["UpcomIndex"] if key == "upcom" else [])):
             try:
-                def _fetch_index():
-                    return Market().index(attempt_idx).ohlcv(start=_days_ago(3), end=_today(), interval="1D")
-                df = _bounded_vnstock_call(_fetch_index, hard_timeout=8)
+                df = Market().index(attempt_idx).ohlcv(start=_days_ago(3), end=_today(), interval="1D")
                 if df is not None and not df.empty:
                     latest = df.iloc[-1]
                     close_col = _col(df, "close", "Close") or df.columns[-2]
@@ -1095,9 +1077,7 @@ def get_analyze(symbol: str):
 def get_index(symbol: str):
     symbol = symbol.upper()
     try:
-        def _fetch_index():
-            return Market().index(symbol).ohlcv(start=_days_ago(30), end=_today(), interval="1D")
-        df = _bounded_vnstock_call(_fetch_index, hard_timeout=10)
+        df = Market().index(symbol).ohlcv(start=_days_ago(30), end=_today(), interval="1D")
         if df is None or df.empty:
             return _err(f"Không có dữ liệu chỉ số {symbol}", 404)
         latest = df.iloc[-1]
