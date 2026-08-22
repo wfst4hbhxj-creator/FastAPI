@@ -22,6 +22,9 @@ requests
 # Ghim version 2.0.0 (bản mới nhất đã xác nhận trên PyPI) để tránh bản sau đổi API phá vỡ code.
 dnse-sdk-openapi==2.0.0
 
+# --- WebSocket encoding for DNSE ---
+msgpack==1.2.1
+
 # --- Core Dependencies ---
 # Unpinned pandas so pip uses the latest pre-compiled wheel (avoids building from source)
 pandas
