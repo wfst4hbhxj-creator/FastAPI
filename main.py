@@ -117,12 +117,15 @@ def _serialize(obj):
     return clean
 
 # ===== DNSE OPENAPI CLIENT — lazy singleton, Market Data API only =====
+# NOTE: Render free tier (Singapore/US) cannot reliably connect to Vietnam's DNSE API.
+# DNSE is optional - all endpoints gracefully fallback to vnstock sources (VCI/TCBS/MSN).
 _dnse_client = None
 _dnse_last_init_attempt = 0
-_DNSE_INIT_RETRY_INTERVAL = 60  # giây - thử lại sau 60s nếu init thất bại
+_DNSE_INIT_RETRY_INTERVAL = 300  # 5 phút - thử lại sau 5 phút nếu init thất bại
 _dnse_unreachable_count = 0
-_DNSE_MAX_UNREACHABLE = 3  # sau 3 lần thất bại liên tiếp, tạm ngừng gọi DNSE
+_DNSE_MAX_UNREACHABLE = 2  # sau 2 lần thất bại liên tiếp, tạm ngừng gọi DNSE
 _dnse_last_success = 0
+_DNSE_QUICK_TIMEOUT = 5  # giây - timeout nhanh cho DNSE calls
 
 def _get_dnse_client():
     """Khởi tạo DNSEClient dạng lazy singleton. Tự retry sau interval nếu env vars được set sau."""
@@ -153,32 +156,34 @@ def _get_dnse_client():
         logger.warning(f"DNSE client init lỗi: {e}")
         return None
 
-def _dnse_call_with_fallback(call_func, *args, **kwargs):
+def _dnse_quick_call(call_func, *args, **kwargs):
     """
-    Wrapper gọi DNSE API với circuit breaker:
-    - Thử gọi, nếu connect timeout -> count unreachable
-    - Sau 3 lần unreachable liên tiếp -> tạm dừng gọi DNSE 5 phút
-    - Có success -> reset counter
+    Gọi DNSE API với timeout nhanh (5s) và circuit breaker.
+    - Timeout 5s max
+    - Circuit breaker sau 2 lần fail liên tiếp -> nghỉ 5 phút
+    - Return (status, body) hoặc (None, error)
     """
     global _dnse_unreachable_count, _dnse_last_success
     now = time.time()
     
-    # Nếu quá nhiều lỗi liên tiếp, tạm ngừng 5 phút
+    # Circuit breaker: nếu quá nhiều lỗi liên tiếp, tạm ngừng 5 phút
     if _dnse_unreachable_count >= _DNSE_MAX_UNREACHABLE:
         if now - _dnse_last_success < 300:  # 5 phút
             return None, "circuit_open"
         else:
             _dnse_unreachable_count = 0  # reset sau 5 phút
     
+    # Chạy trong thread riêng với timeout 5s
+    future = _bounded_executor.submit(call_func, *args, **kwargs)
     try:
-        status, body = call_func(*args, **kwargs)
+        status, body = future.result(timeout=_DNSE_QUICK_TIMEOUT)
         _dnse_unreachable_count = 0
-        _dnse_last_success = now
+        _dnse_last_success = time.time()
         return status, body
     except Exception as e:
         err_msg = str(e).lower()
         # Check nếu là network timeout/connection error
-        if any(kw in err_msg for kw in ["timeout", "connect", "connection", "unreachable", "dns", "resolve"]):
+        if any(kw in str(e).lower() for kw in ["timeout", "connect", "connection", "unreachable", "dns", "resolve", "timed out"]):
             _dnse_unreachable_count += 1
             logger.warning(f"DNSE unreachable ({_dnse_unreachable_count}/{_DNSE_MAX_UNREACHABLE}): {e}")
         else:
@@ -199,7 +204,7 @@ def _dnse_get_latest_quote(symbol):
     cached = _cache_get(key)
     if cached is not None:
         return cached
-    status, body = _dnse_call_with_fallback(
+    status, body = _dnse_quick_call(
         client.get_latest_quote, symbol=symbol, board_id="G1", dry_run=False
     )
     if status == 200 and body:
@@ -211,8 +216,6 @@ def _dnse_get_latest_quote(symbol):
             _cache_set(key, result, TTL_DNSE_QUOTE)
             return result
     return None
-
-def _dnse_get_latest_quote(symbol):
     client = _get_dnse_client()
     if client is None:
         return None
@@ -220,7 +223,7 @@ def _dnse_get_latest_quote(symbol):
     cached = _cache_get(key)
     if cached is not None:
         return cached
-    status, body = _dnse_call_with_fallback(
+    status, body = _dnse_quick_call(
         client.get_latest_quote, symbol=symbol, board_id="G1", dry_run=False
     )
     if status == 200 and body:
@@ -1278,7 +1281,7 @@ def dnse_secdef(symbol: str):
     client = _get_dnse_client()
     if client is None:
         return _err("DNSE client chưa cấu hình (thiếu DNSE_API_KEY/SECRET)", 503)
-    status, body = _dnse_call_with_fallback(
+    status, body = _dnse_quick_call(
         client.get_security_definition, symbol=symbol, board_id="G1", dry_run=False
     )
     if status == 200 and body:
@@ -1311,7 +1314,7 @@ def dnse_ohlc(symbol: str, resolution: str = "1", from_ts: Optional[int] = None,
     if to_ts is None:
         to_ts = int(datetime.now().timestamp())
     query = {"symbol": symbol, "resolution": resolution, "from": from_ts, "to": to_ts}
-    status, body = _dnse_call_with_fallback(client.get_ohlc, "STOCK", query, dry_run=False)
+    status, body = _dnse_quick_call(client.get_ohlc, "STOCK", query, dry_run=False)
     if status == 200 and body:
         result = _serialize_dnse(body)
         _dnse_cache_set(key, result, TTL_DNSE_OHLC)
@@ -1332,7 +1335,7 @@ def dnse_latest_trade(symbol: str):
     client = _get_dnse_client()
     if client is None:
         return _err("DNSE client chưa cấu hình", 503)
-    status, body = _dnse_call_with_fallback(
+    status, body = _dnse_quick_call(
         client.get_latest_trade, symbol=symbol, board_id="G1", dry_run=False
     )
     if status == 200 and body:
@@ -1364,7 +1367,7 @@ def dnse_trades(symbol: str, board_id: str = "G1", from_date: Optional[str] = No
         from_date = _today()
     if to_date is None:
         to_date = _today()
-    status, body = _dnse_call_with_fallback(
+    status, body = _dnse_quick_call(
         client.get_trades,
         symbol=symbol, board_id=board_id,
         from_date=from_date, to_date=to_date,
@@ -1407,7 +1410,7 @@ def dnse_instruments(
         params["security_group_id"] = security_group_id
     if index_name:
         params["index_name"] = index_name
-    status, body = _dnse_call_with_fallback(client.get_instruments, dry_run=False, **params)
+    status, body = _dnse_quick_call(client.get_instruments, dry_run=False, **params)
     if status == 200 and body:
         result = _serialize_dnse(body)
         _dnse_cache_set(key, result, TTL_DNSE_INSTRUMENTS)

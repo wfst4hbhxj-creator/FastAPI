@@ -9,7 +9,7 @@ uvicorn[standard]==0.32.1
 pydantic==2.10.4
 
 # --- VNStock v4 ---
-vnstock==4.0.4
+vnstock==4.0.7
 
 # --- HTTP trực tiếp (Lớp 2 fallback fund-holdings gọi thẳng fmarket.vn) ---
 # Đã là dependency gián tiếp của vnstock, khai báo rõ vì main.py giờ import trực tiếp
