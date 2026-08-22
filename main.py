@@ -266,26 +266,19 @@ FUND_HOLDINGS_FALLBACK = {
     "DCBF": [],  # TODO: người dùng tự điền top 10 holding DCBF
 }
 
+# Global executor for bounded calls - reuse to avoid thread exhaustion
+_bounded_executor = ThreadPoolExecutor(max_workers=8)
+
+
 def _bounded_call(fn, args=(), kwargs=None, hard_timeout=6):
     """
-    Chạy fn(*args, **kwargs) trong 1 thread riêng với timeout CỨNG từ bên ngoài.
-    Dùng khi fn không hỗ trợ truyền timeout ngắn (vd Reference().fund().top_holding() của
-    vnstock — timeout mặc định 30s nằm sâu trong vnstock.core.utils.client.send_request,
-    không có cách nào override từ bên ngoài).
-
-    QUAN TRỌNG — bug đã tự kiểm chứng bằng code thật, PHẢI tránh:
-    KHÔNG được dùng `with ThreadPoolExecutor(...) as ex:` ở đây. __exit__ của context
-    manager gọi shutdown(wait=True) mặc định, khiến hàm vẫn chờ luồng treo chạy xong mới
-    return — phản tác dụng hoàn toàn với mục đích timeout cứng. Cách đúng: tạo executor
-    thủ công, gọi shutdown(wait=False) trong finally để luồng mồ côi tự chết ở background,
-    không block caller.
-
-    Trả None nếu timeout hoặc lỗi (không raise ra ngoài) — caller tự coi None là "thất bại".
+    Chạy fn(*args, **kwargs) trong thread riêng với timeout CỨNG.
+    Dùng shared executor để tránh tạo quá nhiều thread.
+    Trả None nếu timeout hoặc lỗi.
     """
     kwargs = kwargs or {}
-    executor = ThreadPoolExecutor(max_workers=1)
+    future = _bounded_executor.submit(fn, *args, **kwargs)
     try:
-        future = executor.submit(fn, *args, **kwargs)
         return future.result(timeout=hard_timeout)
     except FutureTimeoutError:
         logger.warning(f"_bounded_call: {getattr(fn, '__name__', fn)} vượt timeout cứng {hard_timeout}s")
@@ -293,56 +286,43 @@ def _bounded_call(fn, args=(), kwargs=None, hard_timeout=6):
     except Exception as e:
         logger.warning(f"_bounded_call: {getattr(fn, '__name__', fn)} lỗi: {e}")
         return None
-    finally:
-        executor.shutdown(wait=False)  # KHÔNG chờ luồng treo — để nó tự chết ở background
 
 
 def _bounded_vnstock_call(fn, args=(), kwargs=None, hard_timeout=10):
-    """
-    Wrapper cho các gọi vnstock (Market, Reference, Fundamental) với timeout cứng.
-    Tương tự _bounded_call nhưng timeout mặc định dài hơn (10s) vì vnstock network call chậm hơn.
-    """
+    """Wrapper cho vnstock calls với timeout 10s mặc định."""
     return _bounded_call(fn, args, kwargs, hard_timeout)
 
 def _fetch_funds_parallel(fund_names):
     """
-    Chạy _fetch_fund_holdings() cho nhiều quỹ CÙNG LÚC thay vì tuần tự, để thời gian tổng
-    không cộng dồn theo số quỹ. Trả về dict {fund_name: holdings_list}. Lỗi/timeout của
-    1 quỹ không ảnh hưởng các quỹ khác (trả [] cho quỹ đó).
-    Không dùng `with ThreadPoolExecutor` — lý do giống _bounded_call ở trên.
+    Chạy _fetch_fund_holdings() cho nhiều quỹ CÙNG LÚC thay vì tuần tự.
+    Dùng shared executor để tránh thread exhaustion.
     """
     fund_names = list(fund_names)
-    executor = ThreadPoolExecutor(max_workers=max(1, len(fund_names)))
     results = {fn: [] for fn in fund_names}
     try:
-        futures = {executor.submit(_fetch_fund_holdings, fn): fn for fn in fund_names}
+        futures = {_bounded_executor.submit(_fetch_fund_holdings, fn): fn for fn in fund_names}
         for future in futures:
             fn = futures[future]
             try:
-                # Mỗi _fetch_fund_holdings() đã tự bounded ở bên trong (lớp 1: ~12s, lớp 2: ~12s),
-                # timeout 30s ở đây chỉ là lưới an toàn tầng ngoài, không phải cơ chế chính.
                 results[fn] = future.result(timeout=30) or []
             except Exception as e:
                 logger.warning(f"_fetch_funds_parallel: quỹ {fn} lỗi/timeout: {e}")
                 results[fn] = []
         return results
-    finally:
-        executor.shutdown(wait=False)
+    except Exception as e:
+        logger.error(f"_fetch_funds_parallel: {e}")
+        return {fn: [] for fn in fund_names}
 
 def _map_parallel(items, fn, timeout_per_item=15):
     """
-    Chạy fn(item) cho từng item trong `items` CÙNG LÚC thay vì tuần tự — dùng cho các endpoint
-    xử lý nhiều mã trong 1 request (vd /recommend chấm điểm nhiều mã qua get_quality).
-    Trả về dict {item: result_or_None}. Lỗi/timeout của 1 item không ảnh hưởng item khác.
-    Không dùng `with ThreadPoolExecutor` — lý do giống _bounded_call/_fetch_funds_parallel ở trên.
+    Chạy fn(item) cho từng item CÙNG LÚC — dùng shared executor.
     """
     items = list(items)
     if not items:
         return {}
-    executor = ThreadPoolExecutor(max_workers=max(1, len(items)))
     results = {item: None for item in items}
     try:
-        futures = {executor.submit(fn, item): item for item in items}
+        futures = {_bounded_executor.submit(fn, item): item for item in items}
         for future in futures:
             item = futures[future]
             try:
@@ -351,8 +331,9 @@ def _map_parallel(items, fn, timeout_per_item=15):
                 logger.warning(f"_map_parallel: item {item} lỗi/timeout: {e}")
                 results[item] = None
         return results
-    finally:
-        executor.shutdown(wait=False)
+    except Exception as e:
+        logger.error(f"_map_parallel: {e}")
+        return {item: None for item in items}
 
 def _fetch_fund_holdings(fund_name):
     """
