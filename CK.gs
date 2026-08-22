@@ -1,34 +1,54 @@
 // =====================================
-// 🔐 THÔNG TIN CẤU HÌNH — KHÔNG THAY ĐỔI
+// 🔐 THÔNG TIN CẤU HÌNH — ĐỌC TỪ PROPERTIES SERVICE
 // =====================================
-const TELEGRAM_TOKEN   = '8545515587:AAF6uC6kvliAgGrP3gSuTDtc3XxPJMjZXDg';
-const TELEGRAM_URL     = "https://api.telegram.org/bot" + TELEGRAM_TOKEN;
-const ADMIN_CHAT_ID    = '1538608902';
+function getConfig() {
+  const props = PropertiesService.getScriptProperties();
+  return {
+    TELEGRAM_TOKEN: props.getProperty('TELEGRAM_TOKEN'),
+    ADMIN_CHAT_ID: props.getProperty('ADMIN_CHAT_ID'),
+    GEMINI_API_KEY: props.getProperty('GEMINI_API_KEY'),
+    GROQ_API_KEY: props.getProperty('GROQ_API_KEY'),
+    API_BASE: props.getProperty('API_BASE') || 'https://fastapi-3k2j.onrender.com',
+    GEMINI_MODEL: 'gemini-2.5-flash-lite',
+    GROQ_MODEL: 'openai/gpt-oss-20b'
+  };
+}
+
+// Helper lấy config cache để tránh đọc PropertiesService nhiều lần
+let _configCache = null;
+function cfg(key) {
+  if (!_configCache) _configCache = getConfig();
+  return _configCache[key];
+}
+
+// =====================================
+// 🔧 SETUP SECRETS — Chạy 1 lần trong GAS console để nạp .env vào PropertiesService
+// =====================================
+function setupSecrets() {
+  const props = PropertiesService.getScriptProperties();
+  props.setProperties({
+    'TELEGRAM_TOKEN': '',      // Điền từ .env
+    'ADMIN_CHAT_ID': '',       // Điền từ .env
+    'GEMINI_API_KEY': '',      // Điền từ .env
+    'GROQ_API_KEY': '',        // Điền từ .env
+    'API_BASE': 'https://fastapi-3k2j.onrender.com'
+  });
+  Logger.log('✅ Secrets đã lưu vào PropertiesService — NHỚ ĐIỀN GIÁ TRỊ THẬT VÀO TRƯỚC KHI CHẠY!');
+}
 
 // =====================================
 // 🌐 API BASE — V4
 // =====================================
-const API_BASE = "https://vnstockapi.containers.snapdeploy.app";
-
-// =====================================
-// 🤖 GỌI AI — 2 tầng: Gemini 2.5 Flash-Lite (chính) → gpt-oss-20b qua Groq (backup, free tier)
-// Đã tra giá thật (không đoán):
-//   - gemini-2.5-flash-lite: ~$0.1 input / $0.4 output mỗi 1M token, tối ưu độ trễ thấp
-//   - openai/gpt-oss-20b (Groq): ~$0.075 input / $0.30 output, ~1000 tok/s, free tier (không cần thẻ)
-// ⚠️ gemini-2.5-flash-lite NGỪNG HOẠT ĐỘNG từ 16/10/2026 (Gemini Developer API) — cần đổi
-// GEMINI_MODEL trước ngày này, xem thông báo deprecation chính thức của Google khi gần tới hạn.
-// =====================================
-const GEMINI_API_KEY = 'PASTE_GEMINI_API_KEY';
-const GROQ_API_KEY   = 'PASTE_GROQ_API_KEY';
-const GEMINI_MODEL   = 'gemini-2.5-flash-lite';
-const GROQ_MODEL     = 'openai/gpt-oss-20b';
+const API_BASE = cfg('API_BASE');
 
 function callAI(promptText, useSearch) {
   useSearch = !!useSearch; // mặc định false nếu không truyền
   const systemPrompt = "Bạn là chuyên gia phân tích chứng khoán Việt Nam. Trả lời bằng tiếng Việt CÓ DẤU. KHÔNG chèn link. Ngắn gọn.";
 
   // ── Tầng 1: Gemini 2.5 Flash-Lite ──
-  if (GEMINI_API_KEY && !GEMINI_API_KEY.startsWith('PASTE_')) {
+  const geminiKey = cfg('GEMINI_API_KEY');
+  const geminiModel = cfg('GEMINI_MODEL');
+  if (geminiKey && !geminiKey.startsWith('PASTE_')) {
     try {
       const body = {
         contents: [{ parts: [{ text: promptText }] }],
@@ -37,13 +57,13 @@ function callAI(promptText, useSearch) {
       };
       if (useSearch) body.tools = [{ google_search: {} }];
       const res = UrlFetchApp.fetch(
-        "https://generativelanguage.googleapis.com/v1beta/models/" + GEMINI_MODEL + ":generateContent?key=" + GEMINI_API_KEY,
+        "https://generativelanguage.googleapis.com/v1beta/models/" + geminiModel + ":generateContent?key=" + geminiKey,
         {
           method: "post",
           contentType: "application/json",
           payload: JSON.stringify(body),
           muteHttpExceptions: true,
-          timeout: 15 // ~15s theo yêu cầu — tổng tệ nhất 15+12=27s, an toàn hơn hẳn bản 3 tầng cũ
+          timeout: 15
         }
       );
       if (res.getResponseCode() === 200) {
@@ -58,14 +78,16 @@ function callAI(promptText, useSearch) {
   }
 
   // ── Tầng 2: gpt-oss-20b qua Groq (backup, free tier) ──
-  if (GROQ_API_KEY && !GROQ_API_KEY.startsWith('PASTE_')) {
+  const groqKey = cfg('GROQ_API_KEY');
+  const groqModel = cfg('GROQ_MODEL');
+  if (groqKey && !groqKey.startsWith('PASTE_')) {
     try {
       const res = UrlFetchApp.fetch("https://api.groq.com/openai/v1/chat/completions", {
         method: "post",
         contentType: "application/json",
-        headers: { "Authorization": "Bearer " + GROQ_API_KEY },
+        headers: { "Authorization": "Bearer " + groqKey },
         payload: JSON.stringify({
-          model: GROQ_MODEL,
+          model: groqModel,
           messages: [
             { role: "system", content: systemPrompt },
             { role: "user", content: promptText }
@@ -75,7 +97,7 @@ function callAI(promptText, useSearch) {
           reasoning_effort: "low"
         }),
         muteHttpExceptions: true,
-        timeout: 12 // ~12s theo yêu cầu
+        timeout: 12
       });
       if (res.getResponseCode() === 200) {
         const text = JSON.parse(res.getContentText())?.choices?.[0]?.message?.content;
@@ -91,6 +113,36 @@ function callAI(promptText, useSearch) {
 // =====================================
 // 🧹 CLEAN TEXT
 // =====================================
+// =====================================
+// 🗄 CACHE AI NGẮN HẠN — cho nhận định so sánh/xếp hạng lặp lại trong thời gian ngắn
+// TRADE-OFF (đọc kỹ trước khi dùng ở chỗ khác): nếu cùng 1 prompt (cùng bộ mã + cùng số
+// liệu bot đã tính: giá, điểm...) được hỏi lại trong TTL, trả lại ĐÚNG văn bản AI đã sinh
+// trước đó thay vì gọi AI mới — giảm chi phí + độ trễ cảm nhận. Cache key là hash của TOÀN
+// BỘ promptText (không chỉ danh sách mã) — nên nếu bất kỳ số liệu nào trong prompt đổi (giá
+// cập nhật, điểm đổi...), prompt sẽ khác → cache tự động MISS, không có rủi ro trả về nhận
+// định dựa trên số liệu cũ. CHỈ dùng cho các đoạn AI chỉ diễn giải trên số liệu đã tính sẵn
+// (useSearch=false) — KHÔNG dùng cho tin tức/phân tích cần luôn mới nhất mỗi lần hỏi.
+// =====================================
+function callAICached(promptText, ttlSeconds) {
+  ttlSeconds = ttlSeconds || 300; // mặc định 5 phút, trong khoảng 5-10 phút theo thiết kế
+  try {
+    const cache = CacheService.getScriptCache();
+    const key = "AI_" + Utilities.base64EncodeWebSafe(
+      Utilities.computeDigest(Utilities.DigestAlgorithm.MD5, promptText)
+    ).substring(0, 40);
+    const cached = cache.get(key);
+    if (cached) return cached;
+    const result = callAI(promptText, false);
+    if (result) {
+      try { cache.put(key, result, ttlSeconds); } catch(e) { Logger.log("callAICached put: "+e); }
+    }
+    return result;
+  } catch(e) {
+    Logger.log("callAICached: "+e);
+    return callAI(promptText, false); // cache lỗi -> fallback gọi thẳng, không chặn chức năng
+  }
+}
+
 function cleanAIText(text) {
   if(!text||text.trim().length<5) return null;
   text=text.replace(/<think>[\s\S]*?<\/think>/gi,'');
@@ -782,7 +834,7 @@ function holdCompareAsync() {
     sendLongMsg(chatId,lines.join("\n"));
 
     const aiCtx=rows.map(r=>r.sym+"="+r.score+"đ("+r.rating+")").join(", ");
-    const aiText=callAI("So sánh tích sản dài hạn các mã: "+aiCtx+". Mã điểm cao nhất là "+rows[0].sym+". Giải thích ngắn gọn (2-3 câu) vì sao "+rows[0].sym+" là lựa chọn tốt nhất để tích sản dài hạn trong nhóm này, dựa trên các điểm số đã cho. Tiếng Việt có dấu, không chèn link, không tự tính lại điểm.");  // useSearch=false (mặc định) — chỉ diễn giải điểm đã tính, không cần search
+    const aiText=callAICached("So sánh tích sản dài hạn các mã: "+aiCtx+". Mã điểm cao nhất là "+rows[0].sym+". Giải thích ngắn gọn (2-3 câu) vì sao "+rows[0].sym+" là lựa chọn tốt nhất để tích sản dài hạn trong nhóm này, dựa trên các điểm số đã cho. Tiếng Việt có dấu, không chèn link, không tự tính lại điểm.", 300);  // cache 5 phút — key theo hash prompt (gồm cả điểm), tự MISS khi điểm đổi
     if(aiText) sendMsg(chatId,"🤖 "+(cleanAIText(aiText)||""));
     return;
   }
@@ -826,7 +878,7 @@ function holdCompareAsync() {
 
   const aiCtx=alloc.filter(a=>a.priceK).map(a=>a.sym+"="+a.qty+"cổ("+a.score+"đ)").join(", ");
   if(aiCtx){
-    const aiText=callAI("Phân bổ vốn tích sản dài hạn theo điểm chất lượng (đã tính sẵn bằng code, KHÔNG thay đổi số liệu): "+aiCtx+". Giải thích ngắn gọn (2-3 câu) cơ sở của cách phân bổ này và lưu ý rủi ro. Tiếng Việt có dấu, không chèn link.");  // useSearch=false (mặc định) — chỉ diễn giải phân bổ đã tính
+    const aiText=callAICached("Phân bổ vốn tích sản dài hạn theo điểm chất lượng (đã tính sẵn bằng code, KHÔNG thay đổi số liệu): "+aiCtx+". Giải thích ngắn gọn (2-3 câu) cơ sở của cách phân bổ này và lưu ý rủi ro. Tiếng Việt có dấu, không chèn link.", 300);  // cache 5 phút — key theo hash prompt (gồm cả số cổ đã tính)
     if(aiText) sendMsg(chatId,"🤖 "+(cleanAIText(aiText)||""));
   }
 }
@@ -845,7 +897,7 @@ function runHoldScan(chatId) {
 function holdScanAsync() {
   deleteAllTriggers("holdScanAsync");
   const props=PropertiesService.getScriptProperties();
-  const chatId=props.getProperty("HOLD_SCAN_CHAT_ID")||ADMIN_CHAT_ID;
+  const chatId=props.getProperty("HOLD_SCAN_CHAT_ID")||cfg('ADMIN_CHAT_ID');
   props.deleteProperty("HOLD_SCAN_CHAT_ID");
 
   const today=new Date().toLocaleDateString("vi-VN");
@@ -856,7 +908,6 @@ function holdScanAsync() {
   if(!candidates){
     // Gọi song song 3 nguồn: /fund-favorites + /growth-stocks + /dividend-kings
     // Không dùng /recommend vì hay timeout — tự build từ /fund-favorites
-    sendMsg(chatId,"⏳ Đang lấy dữ liệu từ quỹ và API...");
     const batchRes = apiBatch(["/fund-favorites","/growth-stocks","/dividend-kings"], 25);
     const favData    = (batchRes[0]&&typeof batchRes[0]==="object") ? batchRes[0] : {};
     const growthData = batchRes[1]&&batchRes[1].stocks ? batchRes[1].stocks : [];
@@ -903,7 +954,6 @@ function holdScanAsync() {
     // Tăng timeout lên 30s để Render không bị cold start timeout
     // Sửa bug: !res.success===false → dùng res.success !== false
     const symsToScore = merged.slice(0,15).map(m=>m.sym);
-    sendMsg(chatId,"⏳ Đang chấm điểm "+symsToScore.length+" mã... (chấm điểm tuần tự để tránh nghẽn RAM server)");
     const scoreResults = [];
     symsToScore.forEach(s => { scoreResults.push(apiGet("/score/"+s, 20)); Utilities.sleep(500); });
     let scoredCount = 0;
@@ -1227,12 +1277,14 @@ function handleDelete(chatId,argStr) {
 
 // Helper: gửi message có inline keyboard
 function sendMsgKeyboard(chatId,text,buttons) {
+  const url = getTelegramUrl();
+  if (!url) { Logger.log("sendMsgKeyboard: TELEGRAM_TOKEN chưa cấu hình"); return; }
   const payload={
     chat_id:chatId, text, parse_mode:"HTML",
     reply_markup: JSON.stringify({inline_keyboard:buttons})
   };
   try{
-    UrlFetchApp.fetch(TELEGRAM_URL+"/sendMessage",{
+    UrlFetchApp.fetch(url+"/sendMessage",{
       method:"post",contentType:"application/json",
       payload:JSON.stringify(payload),muteHttpExceptions:true
     });
@@ -1848,7 +1900,8 @@ function compareSymbolsAsync() {
 
   if(!aiInputs.length) return;
   // useSearch=false (mặc định) — xếp hạng dựa trên KT+CL đã tính sẵn, không cần search
-  const aiText=callAI("So sánh:\n"+aiInputs.join("\n")+"\n\nTP/SL đã tính sẵn, KHÔNG thay đổi.\nTìm tin tức mới nhất từng mã:\n1. Xếp hạng từ tốt đến kém (tổng hợp KT + chất lượng DN)\n2. Mã #1: giải thích tại sao, rủi ro\n3. Mã còn lại: 1 câu\nTiếng Việt có dấu, ngắn gọn.");
+  // cache 5 phút — key theo hash prompt (gồm cả giá/KT/CL đã tính), tự MISS khi số liệu đổi
+  const aiText=callAICached("So sánh:\n"+aiInputs.join("\n")+"\n\nTP/SL đã tính sẵn, KHÔNG thay đổi.\nTìm tin tức mới nhất từng mã:\n1. Xếp hạng từ tốt đến kém (tổng hợp KT + chất lượng DN)\n2. Mã #1: giải thích tại sao, rủi ro\n3. Mã còn lại: 1 câu\nTiếng Việt có dấu, ngắn gọn.", 300);
   sendLongMsg(chatId,"🤖 PHÂN TÍCH AI — SO SÁNH "+syms.join(" vs ")+"\n─────────────────────────\n"+(cleanAIText(aiText)||"AI đang bận."));
 }
 
@@ -1908,7 +1961,7 @@ function handleRecommend(chatId) {
 function recommendAsync() {
   deleteAllTriggers("recommendAsync");
   const props=PropertiesService.getScriptProperties();
-  const chatId=props.getProperty("RECOMMEND_CHAT_ID")||ADMIN_CHAT_ID;
+  const chatId=props.getProperty("RECOMMEND_CHAT_ID")||cfg('ADMIN_CHAT_ID');
   props.deleteProperty("RECOMMEND_CHAT_ID");
 
   Logger.log("recommendAsync: gọi /fund-favorites");
@@ -1950,7 +2003,6 @@ function recommendAsync() {
 
   // Chọn tối đa 12 mã để quét tuần tự (tránh OOM server)
   symbols = symbols.slice(0, 12);
-  sendMsg(chatId, "⏳ Đang chấm điểm " + symbols.length + " mã từ quỹ (xử lý tuần tự để bảo vệ server)...");
 
   let finalList = [];
   for (let i = 0; i < symbols.length; i++) {
@@ -2011,8 +2063,10 @@ function recommendAsync() {
 // =====================================
 function handleCb(chatId, callbackQueryId, data) {
   // Trả lời callback ngay để Telegram không hiện loading
+  const url = getTelegramUrl();
+  if (!url) { Logger.log("handleCb: TELEGRAM_TOKEN chưa cấu hình"); return; }
   try {
-    UrlFetchApp.fetch(TELEGRAM_URL + "/answerCallbackQuery", {
+    UrlFetchApp.fetch(url + "/answerCallbackQuery", {
       method: "post", contentType: "application/json",
       payload: JSON.stringify({ callback_query_id: callbackQueryId }),
       muteHttpExceptions: true
@@ -2171,11 +2225,15 @@ function doPost(e) {
 // 📊 AI STATUS
 // =====================================
 function handleAIStatus(chatId) {
-  const geminiOk = GEMINI_API_KEY && !GEMINI_API_KEY.startsWith('PASTE_');
-  const groqOk   = GROQ_API_KEY && !GROQ_API_KEY.startsWith('PASTE_');
+  const geminiKey = cfg('GEMINI_API_KEY');
+  const groqKey = cfg('GROQ_API_KEY');
+  const geminiModel = cfg('GEMINI_MODEL');
+  const groqModel = cfg('GROQ_MODEL');
+  const geminiOk = geminiKey && !geminiKey.startsWith('PASTE_');
+  const groqOk   = groqKey && !groqKey.startsWith('PASTE_');
   let msg="🤖 Trạng thái AI\nProvider: Gemini 2.5 Flash-Lite → gpt-oss-20b (Groq, free tier)\n─────────────────────────\n";
-  msg+=(geminiOk?"🟢":"🔴")+" Tầng 1 (chính): "+GEMINI_MODEL+(geminiOk?"":" — ⚠️ chưa cấu hình GEMINI_API_KEY")+"\n";
-  msg+=(groqOk?"🟢":"🔴")+" Tầng 2 (backup): "+GROQ_MODEL+(groqOk?"":" — ⚠️ chưa cấu hình GROQ_API_KEY")+"\n";
+  msg+=(geminiOk?"🟢":"🔴")+" Tầng 1 (chính): "+geminiModel+(geminiOk?"":" — ⚠️ chưa cấu hình GEMINI_API_KEY")+"\n";
+  msg+=(groqOk?"🟢":"🔴")+" Tầng 2 (backup): "+groqModel+(groqOk?"":" — ⚠️ chưa cấu hình GROQ_API_KEY")+"\n";
   msg+="Search mode: chỉ bật google_search cho tầng 1 khi tác vụ cần tin tức mới (vd /news, tổng hợp macro) — tầng 2 (Groq) không hỗ trợ search.\n";
   msg+="\n⚠️ gemini-2.5-flash-lite ngừng hoạt động từ 16/10/2026 — cần đổi model trước hạn.";
   sendMsg(chatId,msg);
@@ -2300,7 +2358,7 @@ function markSent(id){PropertiesService.getScriptProperties().setProperty("LAST_
 function runScanAsync() {
   deleteAllTriggers("runScanAsync");
   const props=PropertiesService.getScriptProperties();
-  const chatId=props.getProperty("SCAN_CHAT_ID")||ADMIN_CHAT_ID;
+  const chatId=props.getProperty("SCAN_CHAT_ID")||cfg('ADMIN_CHAT_ID');
   props.deleteProperty("SCAN_CHAT_ID");
   const lockTs=props.getProperty("LOCK_SCAN_TS");
   const isLocked=props.getProperty("LOCK_SCAN")==="true"&&lockTs&&(Date.now()-parseInt(lockTs))<7*60*1000;
@@ -2330,13 +2388,22 @@ function analyzeSingleSymbolAsync() {
 // =====================================
 // 📤 GỬI TELEGRAM
 // =====================================
+function getTelegramUrl() {
+  const token = cfg('TELEGRAM_TOKEN');
+  return token ? "https://api.telegram.org/bot" + token : null;
+}
+
 function sendMsg(chatId,text) {
+  const url = getTelegramUrl();
+  if (!url) { Logger.log("sendMsg: TELEGRAM_TOKEN chưa cấu hình"); return; }
   try{
-    const res=UrlFetchApp.fetch(TELEGRAM_URL+"/sendMessage",{method:"post",contentType:"application/json",payload:JSON.stringify({chat_id:chatId,text:String(text)}),muteHttpExceptions:true});
+    const res=UrlFetchApp.fetch(url+"/sendMessage",{method:"post",contentType:"application/json",payload:JSON.stringify({chat_id:chatId,text:String(text)}),muteHttpExceptions:true});
     if(res.getResponseCode()!==200)Logger.log("sendMsg err "+res.getResponseCode()+": "+res.getContentText().substring(0,200));
   }catch(e){Logger.log("sendMsg ex: "+e);}
 }
 function sendLongMsg(chatId,text) {
+  const url = getTelegramUrl();
+  if (!url) { Logger.log("sendLongMsg: TELEGRAM_TOKEN chưa cấu hình"); return; }
   if(!text||!text.trim())return;
   const MAX=4000;const chunks=[];let rem=String(text).trim();
   while(rem.length>0){
@@ -2345,7 +2412,7 @@ function sendLongMsg(chatId,text) {
     chunks.push(rem.substring(0,cut));rem=rem.substring(cut).trimStart();
   }
   chunks.forEach((chunk,i,arr)=>{
-    try{UrlFetchApp.fetch(TELEGRAM_URL+"/sendMessage",{method:"post",contentType:"application/json",payload:JSON.stringify({chat_id:chatId,text:String(chunk)}),muteHttpExceptions:true});}
+    try{UrlFetchApp.fetch(url+"/sendMessage",{method:"post",contentType:"application/json",payload:JSON.stringify({chat_id:chatId,text:String(chunk)}),muteHttpExceptions:true});}
     catch(e){Logger.log("sendLongMsg ex: "+e);}
     if(i<arr.length-1)Utilities.sleep(400);
   });
@@ -2368,10 +2435,12 @@ function initTriggers() {
   ScriptApp.newTrigger("checkSchedules").timeBased().everyMinutes(5).create();
   const vnTime=new Date(new Date().toLocaleString("en-US",{timeZone:"Asia/Ho_Chi_Minh"}));
   const msg="✅ Trigger đã khởi tạo! Giờ VN: "+vnTime.getHours().toString().padStart(2,"0")+":"+vnTime.getMinutes().toString().padStart(2,"0");
-  Logger.log(msg);sendMsg(ADMIN_CHAT_ID,msg);
+  Logger.log(msg);sendMsg(cfg('ADMIN_CHAT_ID'),msg);
 }
 function setupBotCommands() {
-  UrlFetchApp.fetch(TELEGRAM_URL+"/setMyCommands",{
+  const url = getTelegramUrl();
+  if (!url) { Logger.log("setupBotCommands: TELEGRAM_TOKEN chưa cấu hình"); return; }
+  UrlFetchApp.fetch(url+"/setMyCommands",{
     method:"post",contentType:"application/json",
     payload:JSON.stringify({commands:[
       {command:"scan",        description:"Quét kỹ thuật toàn TT + tự động phân tích danh mục/tích sản/watchlist"},
@@ -2397,7 +2466,7 @@ function setupBotCommands() {
 }
 function testAI() {
   const r=callAI("Nói đúng 3 chữ: TEST THÀNH CÔNG");
-  sendMsg(ADMIN_CHAT_ID,"Test AI: "+(r?cleanAIText(r):"THẤT BẠI"));
+  sendMsg(cfg('ADMIN_CHAT_ID'),"Test AI: "+(r?cleanAIText(r):"THẤT BẠI"));
 }
 function testAPI() {
   const reqs=["/health","/market","/recommend","/hold/FPT","/news/FPT","/score/FPT","/growth-stocks","/dividend-kings"];
@@ -2407,5 +2476,5 @@ function testAPI() {
     const ok=results[i]!==null;
     lines.push((ok?"✅":"❌")+" "+path);
   });
-  sendMsg(ADMIN_CHAT_ID,lines.join("\n"));
+  sendMsg(cfg('ADMIN_CHAT_ID'),lines.join("\n"));
 }

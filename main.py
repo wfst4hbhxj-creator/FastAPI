@@ -314,6 +314,31 @@ def _fetch_funds_parallel(fund_names):
     finally:
         executor.shutdown(wait=False)
 
+def _map_parallel(items, fn, timeout_per_item=15):
+    """
+    Chạy fn(item) cho từng item trong `items` CÙNG LÚC thay vì tuần tự — dùng cho các endpoint
+    xử lý nhiều mã trong 1 request (vd /recommend chấm điểm nhiều mã qua get_quality).
+    Trả về dict {item: result_or_None}. Lỗi/timeout của 1 item không ảnh hưởng item khác.
+    Không dùng `with ThreadPoolExecutor` — lý do giống _bounded_call/_fetch_funds_parallel ở trên.
+    """
+    items = list(items)
+    if not items:
+        return {}
+    executor = ThreadPoolExecutor(max_workers=max(1, len(items)))
+    results = {item: None for item in items}
+    try:
+        futures = {executor.submit(fn, item): item for item in items}
+        for future in futures:
+            item = futures[future]
+            try:
+                results[item] = future.result(timeout=timeout_per_item)
+            except Exception as e:
+                logger.warning(f"_map_parallel: item {item} lỗi/timeout: {e}")
+                results[item] = None
+        return results
+    finally:
+        executor.shutdown(wait=False)
+
 def _fetch_fund_holdings(fund_name):
     """
     Lấy top holding quỹ mở, 4 lớp fallback theo thứ tự, dừng ở lớp đầu tiên thành công:
@@ -747,11 +772,10 @@ def get_fund_favorites():
 def get_fund_check(symbol: str):
     symbol = symbol.upper()
     held_by = []
+    holdings_map = _fetch_funds_parallel(WATCHED_FUNDS)
     for fund_name in WATCHED_FUNDS:
         try:
-            holdings = _fetch_fund_holdings(fund_name)
-            if not holdings:
-                continue
+            holdings = holdings_map.get(fund_name) or []
             for row in holdings:
                 code = str(row.get("stock_code") or row.get("symbol") or row.get("ticker") or "").upper()
                 if code == symbol:
@@ -914,24 +938,32 @@ def compare(symbol1: str, symbol2: str):
 def recommend():
     logger.info("/recommend — bắt đầu quét")
     best: dict = {}
-    for fund_name in ["DCDS", "DCDE"]:
+    # Pre-warm cache cho CẢ 3 quỹ trong WATCHED_FUNDS (kể cả DCBF, dù không dùng làm nguồn
+    # ứng viên bên dưới) — vì get_quality()->get_score()->get_fund_check() sẽ tự gọi lại
+    # WATCHED_FUNDS cho MỖI mã khi chấm điểm song song ở dưới; pre-warm ở đây để N mã đó
+    # đều gặp cache-hit thay vì N lệnh gọi mạng trùng lặp cùng lúc tới cùng 1 quỹ.
+    holdings_map = _fetch_funds_parallel(WATCHED_FUNDS)
+    candidates = []
+    seen = set()
+    for fund_name in ["DCDS", "DCDE"]:  # giữ nguyên nguồn ứng viên như code gốc — chỉ DCDS/DCDE
         try:
-            holdings = _fetch_fund_holdings(fund_name)
-            if not holdings:
-                continue
+            holdings = holdings_map.get(fund_name) or []
             for row in holdings:
                 symbol = str(row.get("stock_code") or row.get("symbol") or row.get("ticker") or "").upper()
-                if not symbol or symbol in best:
-                    continue
-                try:
-                    q = get_quality(symbol)
-                    if isinstance(q, dict) and "score" in q:
-                        best[symbol] = {"symbol": symbol, "score": q["score"],
-                                        "rating": q["rating"], "recommendation": q["recommendation"]}
-                except Exception as e:
-                    logger.warning(f"/recommend — {symbol}: {e}")
+                if symbol and symbol not in seen:
+                    seen.add(symbol)
+                    candidates.append(symbol)
         except Exception as e:
             logger.error(f"/recommend — {fund_name}: {e}")
+
+    quality_map = _map_parallel(candidates, get_quality, timeout_per_item=15)
+    for symbol, q in quality_map.items():
+        try:
+            if isinstance(q, dict) and "score" in q:
+                best[symbol] = {"symbol": symbol, "score": q["score"],
+                                "rating": q["rating"], "recommendation": q["recommendation"]}
+        except Exception as e:
+            logger.warning(f"/recommend — {symbol}: {e}")
     result = sorted(best.values(), key=lambda x: x["score"], reverse=True)
     return result[:10]
 
