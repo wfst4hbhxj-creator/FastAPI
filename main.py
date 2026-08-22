@@ -963,7 +963,10 @@ def recommend():
                     candidates.append(symbol)
         except Exception as e:
             logger.error(f"/recommend — {fund_name}: {e}")
-
+    
+    # Giới hạn số lượng ứng viên để tránh timeout Render (30s)
+    candidates = candidates[:5]
+    
     quality_map = _map_sequential(candidates, get_quality, timeout_per_item=30)
     for symbol, q in quality_map.items():
         try:
@@ -1135,6 +1138,9 @@ def get_growth_stocks():
     if not symbols:
         return {"count": 0, "stocks": []}
     
+    # Giới hạn số lượng symbols để tránh timeout Render (30s)
+    symbols = symbols[:5]
+    
     # Sequential fetch financial summary (vnstock not thread-safe)
     fin_map = _map_sequential(symbols, get_financial_summary, timeout_per_item=10)
     
@@ -1178,6 +1184,9 @@ def get_dividend_kings():
     
     if not symbols:
         return {"count": 0, "stocks": []}
+    
+    # Giới hạn số lượng symbols để tránh timeout Render (30s)
+    symbols = symbols[:5]
     
     # Sequential fetch dividend and score data (vnstock not thread-safe)
     div_map = _map_sequential(symbols, get_dividend, timeout_per_item=10)
