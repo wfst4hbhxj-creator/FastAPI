@@ -37,6 +37,13 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+@app.middleware("http")
+async def add_charset_header(request, call_next):
+    response = await call_next(request)
+    if "application/json" in response.headers.get("content-type", ""):
+        response.headers["content-type"] = "application/json; charset=utf-8"
+    return response
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("vnstock-api")
 
@@ -288,6 +295,14 @@ def _bounded_call(fn, args=(), kwargs=None, hard_timeout=6):
         return None
     finally:
         executor.shutdown(wait=False)  # KHÔNG chờ luồng treo — để nó tự chết ở background
+
+
+def _bounded_vnstock_call(fn, args=(), kwargs=None, hard_timeout=10):
+    """
+    Wrapper cho các gọi vnstock (Market, Reference, Fundamental) với timeout cứng.
+    Tương tự _bounded_call nhưng timeout mặc định dài hơn (10s) vì vnstock network call chậm hơn.
+    """
+    return _bounded_call(fn, args, kwargs, hard_timeout)
 
 def _fetch_funds_parallel(fund_names):
     """
@@ -554,7 +569,9 @@ def get_stock_price(symbol: str):
     except Exception as e:
         logger.warning(f"/stock/{symbol} DNSE lookup lỗi, fallback vnstock: {e}")
     try:
-        quote = Market().equity(symbol).ohlcv(start=_days_ago(5), end=_today(), interval="1D")
+        def _fetch_equity():
+            return Market().equity(symbol).ohlcv(start=_days_ago(5), end=_today(), interval="1D")
+        quote = _bounded_vnstock_call(_fetch_equity, hard_timeout=8)
         if quote is None or quote.empty:
             return _err(f"Không có dữ liệu giá cho {symbol}", 404)
         latest = quote.iloc[-1]
@@ -575,7 +592,9 @@ def get_company(symbol: str):
     if cached is not None:
         return cached
     try:
-        data = Reference().company(symbol).overview()
+        def _fetch_company():
+            return Reference().company(symbol).overview()
+        data = _bounded_vnstock_call(_fetch_company, hard_timeout=10)
         if data is None or (hasattr(data, "empty") and data.empty):
             return _err(f"Không tìm thấy công ty {symbol}", 404)
         result = _serialize(data)
@@ -595,35 +614,35 @@ def get_dividend(symbol: str):
     if cached is not None:
         return cached
     try:
-        try:
-            events = Reference().company(symbol).events()
-            if events is not None and not events.empty:
-                div_mask = events.apply(
-                    lambda r: any(kw in str(r).lower() for kw in ["cổ tức","dividend","chi tra","cash"]),
-                    axis=1
-                )
-                divs = events[div_mask]
-                if not divs.empty:
-                    result = _serialize(divs)
-                    _cache_set(key, result, TTL_COMPANY)
-                    return result
-        except Exception:
-            pass
-        try:
-            ratio = Fundamental().equity(symbol).ratio()
-            if ratio is not None and not ratio.empty:
-                div_cols = [c for c in ratio.columns if "dividend" in str(c).lower() or "div" in str(c).lower()]
-                if div_cols:
-                    all_cols = ([c for c in ["period"] if c in ratio.columns]) + div_cols
-                    result = _serialize(ratio[all_cols].head(8))
-                    _cache_set(key, result, TTL_COMPANY)
-                    return result
-        except Exception:
-            pass
-        return _err(f"Không có dữ liệu cổ tức cho {symbol}", 404)
-    except Exception as e:
-        logger.error(f"/dividend/{symbol}: {e}")
-        return _err(str(e))
+        def _fetch_events():
+            return Reference().company(symbol).events()
+        events = _bounded_vnstock_call(_fetch_events, hard_timeout=8)
+        if events is not None and not events.empty:
+            div_mask = events.apply(
+                lambda r: any(kw in str(r).lower() for kw in ["cổ tức","dividend","chi tra","cash"]),
+                axis=1
+            )
+            divs = events[div_mask]
+            if not divs.empty:
+                result = _serialize(divs)
+                _cache_set(key, result, TTL_COMPANY)
+                return result
+    except Exception:
+        pass
+    try:
+        def _fetch_ratio():
+            return Fundamental().equity(symbol).ratio()
+        ratio = _bounded_vnstock_call(_fetch_ratio, hard_timeout=8)
+        if ratio is not None and not ratio.empty:
+            div_cols = [c for c in ratio.columns if "dividend" in str(c).lower() or "div" in str(c).lower()]
+            if div_cols:
+                all_cols = ([c for c in ["period"] if c in ratio.columns]) + div_cols
+                result = _serialize(ratio[all_cols].head(8))
+                _cache_set(key, result, TTL_COMPANY)
+                return result
+    except Exception:
+        pass
+    return _err(f"Không có dữ liệu cổ tức cho {symbol}", 404)
 
 
 
@@ -637,7 +656,9 @@ def get_financial_summary(symbol: str):
     if cached is not None:
         return cached
     try:
-        ratios = Fundamental().equity(symbol).ratio()
+        def _fetch_ratios():
+            return Fundamental().equity(symbol).ratio()
+        ratios = _bounded_vnstock_call(_fetch_ratios, hard_timeout=10)
         if ratios is None or ratios.empty:
             return _err(f"Không có dữ liệu tài chính cho {symbol}", 404)
 
@@ -704,7 +725,9 @@ def get_financial_summary(symbol: str):
 def get_etf(symbol: str):
     symbol = symbol.upper()
     try:
-        data = Market().etf(symbol).ohlcv(start=_days_ago(30), end=_today())
+        def _fetch_etf():
+            return Market().etf(symbol).ohlcv(start=_days_ago(30), end=_today())
+        data = _bounded_vnstock_call(_fetch_etf, hard_timeout=8)
         if data is None or data.empty:
             return _err(f"Không có dữ liệu ETF {symbol}", 404)
         return _serialize(data.tail(10))
@@ -717,11 +740,13 @@ def get_etf(symbol: str):
 def get_fund_nav(symbol: str):
     symbol = symbol.upper()
     try:
-        mkt = Market()
-        try:
-            nav = mkt.fund(symbol).nav()
-        except Exception:
-            nav = mkt.fund(symbol).history()
+        def _fetch_nav():
+            mkt = Market()
+            try:
+                return mkt.fund(symbol).nav()
+            except Exception:
+                return mkt.fund(symbol).history()
+        nav = _bounded_vnstock_call(_fetch_nav, hard_timeout=8)
         if nav is None or nav.empty:
             return _err(f"Không có dữ liệu NAV cho quỹ {symbol}", 404)
         return _serialize(nav.tail(20))
@@ -743,10 +768,12 @@ def get_fund_top_holdings(symbol: str):
 def get_fund_industry(symbol: str):
     symbol = symbol.upper()
     try:
-        try:
-            data = Reference().fund(symbol).industry_holding()
-        except Exception:
-            data = Market().fund(symbol).industry_holding()
+        def _fetch_industry():
+            try:
+                return Reference().fund(symbol).industry_holding()
+            except Exception:
+                return Market().fund(symbol).industry_holding()
+        data = _bounded_vnstock_call(_fetch_industry, hard_timeout=8)
         if data is None or data.empty:
             return _err(f"Không có dữ liệu phân bổ ngành cho quỹ {symbol}", 404)
         return _serialize(data)
@@ -915,7 +942,9 @@ def get_hold(symbol: str):
             pass
         events_data = None
         try:
-            ev = Reference().company(symbol).events()
+            def _fetch_events():
+                return Reference().company(symbol).events()
+            ev = _bounded_vnstock_call(_fetch_events, hard_timeout=8)
             if ev is not None and not ev.empty:
                 events_data = _serialize(ev.head(5))
         except Exception:
@@ -956,7 +985,7 @@ def recommend():
         except Exception as e:
             logger.error(f"/recommend — {fund_name}: {e}")
 
-    quality_map = _map_parallel(candidates, get_quality, timeout_per_item=15)
+    quality_map = _map_parallel(candidates, get_quality, timeout_per_item=30)
     for symbol, q in quality_map.items():
         try:
             if isinstance(q, dict) and "score" in q:
@@ -987,8 +1016,6 @@ def portfolio_score(data: PortfolioRequest):
 @app.get("/market")
 def get_market():
     result = {}
-    # VNINDEX và VN30 dùng symbol chuẩn
-    # HNX → "HNX" thường không được hỗ trợ, fallback sang mã tương đương
     indices = {
         "vnindex": "VNINDEX",
         "vn30":    "VN30",
@@ -998,7 +1025,9 @@ def get_market():
     for key, idx in indices.items():
         for attempt_idx in ([idx] + (["HNX"] if key == "hnx" else []) + (["UpcomIndex"] if key == "upcom" else [])):
             try:
-                df = Market().index(attempt_idx).ohlcv(start=_days_ago(3), end=_today(), interval="1D")
+                def _fetch_index():
+                    return Market().index(attempt_idx).ohlcv(start=_days_ago(3), end=_today(), interval="1D")
+                df = _bounded_vnstock_call(_fetch_index, hard_timeout=8)
                 if df is not None and not df.empty:
                     latest = df.iloc[-1]
                     close_col = _col(df, "close", "Close") or df.columns[-2]
@@ -1085,7 +1114,9 @@ def get_analyze(symbol: str):
 def get_index(symbol: str):
     symbol = symbol.upper()
     try:
-        df = Market().index(symbol).ohlcv(start=_days_ago(30), end=_today(), interval="1D")
+        def _fetch_index():
+            return Market().index(symbol).ohlcv(start=_days_ago(30), end=_today(), interval="1D")
+        df = _bounded_vnstock_call(_fetch_index, hard_timeout=10)
         if df is None or df.empty:
             return _err(f"Không có dữ liệu chỉ số {symbol}", 404)
         latest = df.iloc[-1]
@@ -1113,28 +1144,40 @@ def get_growth_stocks():
     candidates = []
     seen = set()
     holdings_map = _fetch_funds_parallel(["DCDS", "DCDE", "DCBF"])
+    
+    # Collect unique symbols first
+    symbols = []
     for fund_name in ["DCDS", "DCDE", "DCBF"]:
         try:
             holdings = holdings_map.get(fund_name) or []
             for row in holdings:
                 sym = str(row.get("stock_code") or row.get("symbol") or "").upper()
-                if not sym or sym in seen:
-                    continue
-                seen.add(sym)
-                try:
-                    fin = get_financial_summary(sym)
-                    if not isinstance(fin, dict) or fin.get("periods", 0) == 0:
-                        continue
-                    l = fin.get("latest", {})
-                    roe = l.get("roe"); eps = l.get("eps")
-                    if roe and roe >= 15 and eps and eps > 0:
-                        candidates.append({"symbol": sym, "roe": roe, "eps": eps,
-                                           "debt_to_equity": l.get("debt_to_equity"),
-                                           "pe": l.get("pe"), "pb": l.get("pb")})
-                except Exception:
-                    pass
+                if sym and sym not in seen:
+                    seen.add(sym)
+                    symbols.append(sym)
         except Exception:
             pass
+    
+    if not symbols:
+        return {"count": 0, "stocks": []}
+    
+    # Parallel fetch financial summary
+    fin_map = _map_parallel(symbols, get_financial_summary, timeout_per_item=10)
+    
+    for sym in symbols:
+        try:
+            fin = fin_map.get(sym)
+            if not isinstance(fin, dict) or fin.get("periods", 0) == 0:
+                continue
+            l = fin.get("latest", {})
+            roe = l.get("roe"); eps = l.get("eps")
+            if roe and roe >= 15 and eps and eps > 0:
+                candidates.append({"symbol": sym, "roe": roe, "eps": eps,
+                                   "debt_to_equity": l.get("debt_to_equity"),
+                                   "pe": l.get("pe"), "pb": l.get("pb")})
+        except Exception:
+            pass
+    
     result = sorted(candidates, key=lambda x: x.get("roe", 0), reverse=True)
     return {"count": len(result), "stocks": result[:20]}
 
@@ -1145,26 +1188,39 @@ def get_dividend_kings():
     candidates = []
     seen = set()
     holdings_map = _fetch_funds_parallel(["DCDS", "DCDE", "DCBF"])
+    
+    # Collect unique symbols first
+    symbols = []
     for fund_name in ["DCDS", "DCDE", "DCBF"]:
         try:
             holdings = holdings_map.get(fund_name) or []
             for row in holdings:
                 sym = str(row.get("stock_code") or row.get("symbol") or "").upper()
-                if not sym or sym in seen:
-                    continue
-                seen.add(sym)
-                try:
-                    div = get_dividend(sym)
-                    if not isinstance(div, list) or len(div) == 0:
-                        continue
-                    sc = get_score(sym)
-                    score_val = sc.get("score", 0) if isinstance(sc, dict) else 0
-                    candidates.append({"symbol": sym, "dividend_count": len(div),
-                                       "score": score_val,
-                                       "rating": sc.get("rating") if isinstance(sc, dict) else None})
-                except Exception:
-                    pass
+                if sym and sym not in seen:
+                    seen.add(sym)
+                    symbols.append(sym)
         except Exception:
             pass
+    
+    if not symbols:
+        return {"count": 0, "stocks": []}
+    
+    # Parallel fetch dividend and score data
+    div_map = _map_parallel(symbols, get_dividend, timeout_per_item=10)
+    score_map = _map_parallel(symbols, get_score, timeout_per_item=10)
+    
+    for sym in symbols:
+        try:
+            div = div_map.get(sym)
+            if not isinstance(div, list) or len(div) == 0:
+                continue
+            sc = score_map.get(sym)
+            score_val = sc.get("score", 0) if isinstance(sc, dict) else 0
+            candidates.append({"symbol": sym, "dividend_count": len(div),
+                               "score": score_val,
+                               "rating": sc.get("rating") if isinstance(sc, dict) else None})
+        except Exception:
+            pass
+    
     result = sorted(candidates, key=lambda x: (x.get("dividend_count", 0), x.get("score", 0)), reverse=True)
     return {"count": len(result), "stocks": result[:20]}
