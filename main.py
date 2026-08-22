@@ -118,19 +118,24 @@ def _serialize(obj):
 
 # ===== DNSE OPENAPI CLIENT — lazy singleton, Market Data API only =====
 _dnse_client = None
-_dnse_init_failed = False
+_dnse_last_init_attempt = 0
+_DNSE_INIT_RETRY_INTERVAL = 60  # giây - thử lại sau 60s nếu init thất bại
 
 def _get_dnse_client():
-    """Khởi tạo DNSEClient dạng lazy singleton. Không log secret. Trả None nếu thiếu cấu hình/lỗi."""
-    global _dnse_client, _dnse_init_failed
+    """Khởi tạo DNSEClient dạng lazy singleton. Tự retry sau interval nếu env vars được set sau."""
+    global _dnse_client, _dnse_last_init_attempt
     if _dnse_client is not None:
         return _dnse_client
-    if _dnse_init_failed:
+    
+    now = time.time()
+    # Thử lại sau interval nếu lần trước thất bại
+    if now - _dnse_last_init_attempt < _DNSE_INIT_RETRY_INTERVAL:
         return None
+    
+    _dnse_last_init_attempt = now
     api_key = os.getenv("DNSE_API_KEY")
     api_secret = os.getenv("DNSE_API_SECRET")
     if not api_key or not api_secret:
-        _dnse_init_failed = True
         return None
     try:
         from dnse import DNSEClient
@@ -140,10 +145,10 @@ def _get_dnse_client():
             base_url=os.getenv("DNSE_BASE_URL", "https://openapi.dnse.com.vn"),
             api_version=os.getenv("DNSE_API_VERSION") or None,
         )
+        logger.info("DNSE client khởi tạo thành công")
         return _dnse_client
     except Exception as e:
         logger.warning(f"DNSE client init lỗi: {e}")
-        _dnse_init_failed = True
         return None
 
 TTL_DNSE_QUOTE = 20  # giây — cache riêng, ngắn, tách khỏi các TTL_* khác (giá realtime không nên cache lâu)
