@@ -313,27 +313,21 @@ def _fetch_funds_parallel(fund_names):
         logger.error(f"_fetch_funds_parallel: {e}")
         return {fn: [] for fn in fund_names}
 
-def _map_parallel(items, fn, timeout_per_item=15):
+def _map_sequential(items, fn, timeout_per_item=15):
     """
-    Chạy fn(item) cho từng item CÙNG LÚC — dùng shared executor.
+    Chạy fn(item) cho từng item TUẦN TỰ — dùng cho các endpoint gọi vnstock
+    để tránh crash do thread-safety của vnstock. Giữ timeout logic giống _map_parallel.
     """
     items = list(items)
-    if not items:
-        return {}
-    results = {item: None for item in items}
-    try:
-        futures = {_bounded_executor.submit(fn, item): item for item in items}
-        for future in futures:
-            item = futures[future]
-            try:
-                results[item] = future.result(timeout=timeout_per_item)
-            except Exception as e:
-                logger.warning(f"_map_parallel: item {item} lỗi/timeout: {e}")
-                results[item] = None
-        return results
-    except Exception as e:
-        logger.error(f"_map_parallel: {e}")
-        return {item: None for item in items}
+    results = {}
+    for item in items:
+        try:
+            # Gọi trực tiếp, không dùng thread pool
+            results[item] = fn(item)
+        except Exception as e:
+            logger.warning(f"_map_sequential: item {item} lỗi: {e}")
+            results[item] = None
+    return results
 
 def _fetch_fund_holdings(fund_name):
     """
@@ -977,7 +971,7 @@ def recommend():
         except Exception as e:
             logger.error(f"/recommend — {fund_name}: {e}")
 
-    quality_map = _map_parallel(candidates, get_quality, timeout_per_item=30)
+    quality_map = _map_sequential(candidates, get_quality, timeout_per_item=30)
     for symbol, q in quality_map.items():
         try:
             if isinstance(q, dict) and "score" in q:
@@ -1148,8 +1142,8 @@ def get_growth_stocks():
     if not symbols:
         return {"count": 0, "stocks": []}
     
-    # Parallel fetch financial summary
-    fin_map = _map_parallel(symbols, get_financial_summary, timeout_per_item=10)
+    # Sequential fetch financial summary (vnstock not thread-safe)
+    fin_map = _map_sequential(symbols, get_financial_summary, timeout_per_item=10)
     
     for sym in symbols:
         try:
@@ -1192,9 +1186,9 @@ def get_dividend_kings():
     if not symbols:
         return {"count": 0, "stocks": []}
     
-    # Parallel fetch dividend and score data
-    div_map = _map_parallel(symbols, get_dividend, timeout_per_item=10)
-    score_map = _map_parallel(symbols, get_score, timeout_per_item=10)
+    # Sequential fetch dividend and score data (vnstock not thread-safe)
+    div_map = _map_sequential(symbols, get_dividend, timeout_per_item=10)
+    score_map = _map_sequential(symbols, get_score, timeout_per_item=10)
     
     for sym in symbols:
         try:
