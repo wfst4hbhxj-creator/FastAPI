@@ -1174,3 +1174,206 @@ def get_dividend_kings():
     
     result = sorted(candidates, key=lambda x: (x.get("dividend_count", 0), x.get("score", 0)), reverse=True)
     return {"count": len(result), "stocks": result[:20]}
+
+
+# ===== DNSE MARKET DATA API =====
+
+TTL_DNSE_SECDEF = 24 * 3600  # 24h - tham chiếu mã ít thay đổi
+TTL_DNSE_OHLC = 60  # 1 phút - OHLC realtime
+TTL_DNSE_TRADES = 60  # 1 phút - tick data
+TTL_DNSE_LATEST_TRADE = 10  # 10 giây - giá khớp mới nhất
+TTL_DNSE_INSTRUMENTS = 3600  # 1h - danh sách mã
+
+def _dnse_cache_get(key, ttl):
+    """Cache với TTL riêng cho từng loại dữ liệu DNSE."""
+    item = _cache.get(key)
+    if item and time.time() < item["expires"]:
+        return item["data"]
+    return None
+
+def _dnse_cache_set(key, data, ttl):
+    _cache[key] = {"data": data, "expires": time.time() + ttl}
+
+def _serialize_dnse(obj):
+    """Serialize DNSE response (dict/list) an toàn cho JSON."""
+    if hasattr(obj, "to_dict"):
+        records = obj.to_dict(orient="records")
+    elif isinstance(obj, list):
+        records = obj
+    elif isinstance(obj, dict):
+        records = [obj]
+    else:
+        return obj
+    clean = []
+    for row in records:
+        new_row = {}
+        for k, v in row.items():
+            if isinstance(v, (pd.Timestamp,)):
+                new_row[k] = v.strftime("%Y-%m-%d")
+            elif isinstance(v, float) and (v != v):  # NaN
+                new_row[k] = None
+            elif hasattr(v, "item"):  # numpy scalar
+                new_row[k] = v.item()
+            else:
+                new_row[k] = v
+        clean.append(new_row)
+    return clean
+
+@app.get("/dnse/secdef/{symbol}")
+def dnse_secdef(symbol: str):
+    """Lấy thông tin tham chiếu mã: ceiling, floor, lot size, tick size, board."""
+    symbol = symbol.upper()
+    key = f"dnse_secdef_{symbol}"
+    cached = _dnse_cache_get(key, TTL_DNSE_SECDEF)
+    if cached is not None:
+        return cached
+    client = _get_dnse_client()
+    if client is None:
+        return _err("DNSE client chưa cấu hình (thiếu DNSE_API_KEY/SECRET)", 503)
+    try:
+        status, body = client.get_security_definition(symbol=symbol, board_id="G1", dry_run=False)
+        if status == 200 and body:
+            result = _serialize_dnse(body)
+            _dnse_cache_set(key, result, TTL_DNSE_SECDEF)
+            return result
+        return _err(f"Không tìm thấy thông tin tham chiếu cho {symbol}", 404)
+    except Exception as e:
+        logger.error(f"/dnse/secdef/{symbol}: {e}")
+        return _err(str(e))
+
+
+@app.get("/dnse/ohlc/{symbol}")
+def dnse_ohlc(symbol: str, resolution: str = "1", from_ts: Optional[int] = None, to_ts: Optional[int] = None, limit: int = 500):
+    """
+    Lấy nến OHLC từ DNSE.
+    resolution: "1" (1m), "5" (5m), "15" (15m), "60" (1H), "D" (1D)
+    from_ts/to_ts: Unix timestamp (mặc định 30 ngày gần nhất)
+    limit: số lượng nến tối đa
+    """
+    symbol = symbol.upper()
+    key = f"dnse_ohlc_{symbol}_{resolution}_{from_ts}_{to_ts}_{limit}"
+    cached = _dnse_cache_get(key, TTL_DNSE_OHLC)
+    if cached is not None:
+        return cached
+    client = _get_dnse_client()
+    if client is None:
+        return _err("DNSE client chưa cấu hình", 503)
+    try:
+        if from_ts is None:
+            from_ts = int((datetime.now() - timedelta(days=30)).timestamp())
+        if to_ts is None:
+            to_ts = int(datetime.now().timestamp())
+        query = {
+            "symbol": symbol,
+            "resolution": resolution,
+            "from": from_ts,
+            "to": to_ts,
+        }
+        status, body = client.get_ohlc("STOCK", query, dry_run=False)
+        if status == 200 and body:
+            result = _serialize_dnse(body)
+            _dnse_cache_set(key, result, TTL_DNSE_OHLC)
+            return result
+        return _err(f"Không có dữ liệu OHLC cho {symbol}", 404)
+    except Exception as e:
+        logger.error(f"/dnse/ohlc/{symbol}: {e}")
+        return _err(str(e))
+
+
+@app.get("/dnse/latest-trade/{symbol}")
+def dnse_latest_trade(symbol: str):
+    """Lấy giá khớp lệnh mới nhất (tick realtime) từ DNSE."""
+    symbol = symbol.upper()
+    key = f"dnse_latest_trade_{symbol}"
+    cached = _dnse_cache_get(key, TTL_DNSE_LATEST_TRADE)
+    if cached is not None:
+        return cached
+    client = _get_dnse_client()
+    if client is None:
+        return _err("DNSE client chưa cấu hình", 503)
+    try:
+        status, body = client.get_latest_trade(symbol=symbol, board_id="G1", dry_run=False)
+        if status == 200 and body:
+            result = _serialize_dnse(body)
+            _dnse_cache_set(key, result, TTL_DNSE_LATEST_TRADE)
+            return result
+        return _err(f"Không có tick mới nhất cho {symbol}", 404)
+    except Exception as e:
+        logger.error(f"/dnse/latest-trade/{symbol}: {e}")
+        return _err(str(e))
+
+
+@app.get("/dnse/trades/{symbol}")
+def dnse_trades(symbol: str, board_id: str = "G1", from_date: Optional[str] = None, to_date: Optional[str] = None, limit: int = 1000, order: str = "DESC"):
+    """
+    Lấy lịch sử tick (time & sales) từ DNSE.
+    from_date/to_date: format "YYYY-MM-DD" (mặc định hôm nay)
+    limit: tối đa 5000
+    order: "ASC" hoặc "DESC"
+    """
+    symbol = symbol.upper()
+    key = f"dnse_trades_{symbol}_{board_id}_{from_date}_{to_date}_{limit}_{order}"
+    cached = _dnse_cache_get(key, TTL_DNSE_TRADES)
+    if cached is not None:
+        return cached
+    client = _get_dnse_client()
+    if client is None:
+        return _err("DNSE client chưa cấu hình", 503)
+    try:
+        if from_date is None:
+            from_date = _today()
+        if to_date is None:
+            to_date = _today()
+        status, body = client.get_trades(
+            symbol=symbol, board_id=board_id,
+            from_date=from_date, to_date=to_date,
+            limit=min(limit, 5000), order=order, dry_run=False
+        )
+        if status == 200 and body:
+            result = _serialize_dnse(body)
+            _dnse_cache_set(key, result, TTL_DNSE_TRADES)
+            return result
+        return _err(f"Không có tick data cho {symbol}", 404)
+    except Exception as e:
+        logger.error(f"/dnse/trades/{symbol}: {e}")
+        return _err(str(e))
+
+
+@app.get("/dnse/instruments")
+def dnse_instruments(
+    symbol: Optional[str] = None,
+    market_id: Optional[str] = None,
+    security_group_id: Optional[str] = None,
+    index_name: Optional[str] = None,
+    limit: int = 100,
+    page: int = 1
+):
+    """
+    Tìm kiếm mã chứng khoán theo filter: symbol, market, group, index (VN30, HNX30...).
+    """
+    key = f"dnse_instruments_{symbol}_{market_id}_{security_group_id}_{index_name}_{limit}_{page}"
+    cached = _dnse_cache_get(key, TTL_DNSE_INSTRUMENTS)
+    if cached is not None:
+        return cached
+    client = _get_dnse_client()
+    if client is None:
+        return _err("DNSE client chưa cấu hình", 503)
+    try:
+        params = {"limit": limit, "page": page}
+        if symbol:
+            params["symbol"] = symbol
+        if market_id:
+            params["market_id"] = market_id
+        if security_group_id:
+            params["security_group_id"] = security_group_id
+        if index_name:
+            params["index_name"] = index_name
+        status, body = client.get_instruments(dry_run=False, **params)
+        if status == 200 and body:
+            result = _serialize_dnse(body)
+            _dnse_cache_set(key, result, TTL_DNSE_INSTRUMENTS)
+            return result
+        return _err("Không tìm thấy mã phù hợp", 404)
+    except Exception as e:
+        logger.error(f"/dnse/instruments: {e}")
+        return _err(str(e))
