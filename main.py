@@ -120,15 +120,37 @@ def _serialize(obj):
 _dnse_client = None
 _dnse_last_init_attempt = 0
 _DNSE_INIT_RETRY_INTERVAL = 60  # giây - thử lại sau 60s nếu init thất bại
+_dnse_unreachable_count = 0
+_DNSE_MAX_UNREACHABLE = 3  # sau 3 lần thất bại liên tiếp, tạm ngừng gọi DNSE
+_dnse_last_success = 0
+
+def _create_dnse_http_client():
+    """Tạo httpx client với timeout dài và retry cho Render->Vietnam."""
+    import httpx
+    from httpx import Retry
+    # Tạo retry strategy: 3 lần retry, exponential backoff
+    retry = Retry(
+        total=3,
+        backoff_factor=2.0,  # 2s, 4s, 8s
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=["GET", "POST"]
+    )
+    # Timeout: connect 30s, read 60s, write 30s, pool 60s
+    timeout = httpx.Timeout(connect=30.0, read=60.0, write=30.0, pool=60.0)
+    limits = httpx.Limits(max_keepalive_connections=5, max_connections=10)
+    return httpx.Client(
+        timeout=timeout,
+        limits=limits,
+        transport=httpx.HTTPTransport(retries=retry)
+    )
 
 def _get_dnse_client():
-    """Khởi tạo DNSEClient dạng lazy singleton. Tự retry sau interval nếu env vars được set sau."""
+    """Khởi tạo DNSEClient dạng lazy singleton với httpx client tùy chỉnh."""
     global _dnse_client, _dnse_last_init_attempt
     if _dnse_client is not None:
         return _dnse_client
     
     now = time.time()
-    # Thử lại sau interval nếu lần trước thất bại
     if now - _dnse_last_init_attempt < _DNSE_INIT_RETRY_INTERVAL:
         return None
     
@@ -139,27 +161,69 @@ def _get_dnse_client():
         return None
     try:
         from dnse import DNSEClient
+        http_client = _create_dnse_http_client()
         _dnse_client = DNSEClient(
             api_key=api_key,
             api_secret=api_secret,
             base_url=os.getenv("DNSE_BASE_URL", "https://openapi.dnse.com.vn"),
             api_version=os.getenv("DNSE_API_VERSION") or None,
+            http_client=http_client  # Pass custom httpx client
         )
-        logger.info("DNSE client khởi tạo thành công")
+        logger.info("DNSE client khởi tạo thành công (timeout 60s, retry 3x)")
         return _dnse_client
+    except TypeError:
+        # DNSEClient có thể không hỗ trợ http_client param, fallback default
+        logger.warning("DNSEClient không hỗ trợ http_client tùy chỉnh, dùng mặc định")
+        try:
+            from dnse import DNSEClient
+            _dnse_client = DNSEClient(
+                api_key=api_key,
+                api_secret=api_secret,
+                base_url=os.getenv("DNSE_BASE_URL", "https://openapi.dnse.com.vn"),
+                api_version=os.getenv("DNSE_API_VERSION") or None,
+            )
+            logger.info("DNSE client khởi tạo thành công (default timeout)")
+            return _dnse_client
+        except Exception as e:
+            logger.warning(f"DNSE client init lỗi: {e}")
+            return None
     except Exception as e:
         logger.warning(f"DNSE client init lỗi: {e}")
         return None
 
-TTL_DNSE_QUOTE = 20  # giây — cache riêng, ngắn, tách khỏi các TTL_* khác (giá realtime không nên cache lâu)
+def _dnse_call_with_fallback(call_func, *args, **kwargs):
+    """
+    Wrapper gọi DNSE API với circuit breaker:
+    - Thử gọi, nếu connect timeout -> count unreachable
+    - Sau 3 lần unreachable liên tiếp -> tạm dừng gọi DNSE 5 phút
+    - Có success -> reset counter
+    """
+    global _dnse_unreachable_count, _dnse_last_success
+    now = time.time()
+    
+    # Nếu quá nhiều lỗi liên tiếp, tạm ngừng 5 phút
+    if _dnse_unreachable_count >= _DNSE_MAX_UNREACHABLE:
+        if now - _dnse_last_success < 300:  # 5 phút
+            return None, "circuit_open"
+        else:
+            _dnse_unreachable_count = 0  # reset sau 5 phút
+    
+    try:
+        status, body = call_func(*args, **kwargs)
+        _dnse_unreachable_count = 0
+        _dnse_last_success = now
+        return status, body
+    except Exception as e:
+        err_msg = str(e).lower()
+        # Check nếu là network timeout/connection error
+        if any(kw in err_msg for kw in ["timeout", "connect", "connection", "unreachable", "dns", "resolve"]):
+            _dnse_unreachable_count += 1
+            logger.warning(f"DNSE unreachable ({_dnse_unreachable_count}/{_DNSE_MAX_UNREACHABLE}): {e}")
+        else:
+            logger.warning(f"DNSE call lỗi: {e}")
+        return None, str(e)
 
 def _dnse_get_latest_quote(symbol):
-    """
-    Lấy báo giá mới nhất từ DNSE Market Data API (get_latest_quote).
-    Trả về {"close": <nghìn đồng>, "volume": <int|None>} hoặc None nếu lỗi/không có client.
-    LƯU Ý ĐƠN VỊ: DNSE trả giá theo VND thực (vd 60500), toàn hệ thống (vnstock, GAS bot)
-    đang dùng đơn vị nghìn đồng (vd 60.5) — nên phải chia 1000 ở đây để KHÔNG phá vỡ quy ước cũ.
-    """
     client = _get_dnse_client()
     if client is None:
         return None
@@ -167,27 +231,17 @@ def _dnse_get_latest_quote(symbol):
     cached = _cache_get(key)
     if cached is not None:
         return cached
-    try:
-        # TODO: VERIFY WITH CURRENT DNSE SPEC — board_id chuẩn theo từng sàn (HOSE/HNX/UPCOM)
-        # chưa được xác nhận rõ trong api.md (chỉ có ví dụ "G1" cho mã GAS). Dùng "G1" tạm thời;
-        # nếu DNSE trả lỗi/rỗng, code sẽ tự fallback về vnstock bên dưới nên không ảnh hưởng độ tin cậy.
-        status, body = client.get_latest_quote(symbol=symbol, board_id="G1", dry_run=False)
-        if status == 200 and body:
-            raw_close = (
-                body.get("matchPrice") or body.get("closePrice")
-                or body.get("close") or body.get("price")
-            )
-            raw_volume = body.get("matchQtty") or body.get("volume") or body.get("totalVolume")
-            close_vnd = _safe_float(raw_close)
-            if close_vnd is not None and close_vnd > 0:
-                result = {
-                    "close": round(close_vnd / 1000, 2),
-                    "volume": int(raw_volume) if raw_volume is not None else None,
-                }
-                _cache_set(key, result, TTL_DNSE_QUOTE)
-                return result
-    except Exception as e:
-        logger.warning(f"DNSE get_latest_quote {symbol}: {e}")
+    status, body = _dnse_call_with_fallback(
+        client.get_latest_quote, symbol=symbol, board_id="G1", dry_run=False
+    )
+    if status == 200 and body:
+        raw_close = body.get("matchPrice") or body.get("closePrice") or body.get("close") or body.get("price")
+        raw_volume = body.get("matchQtty") or body.get("volume") or body.get("totalVolume")
+        close_vnd = _safe_float(raw_close)
+        if close_vnd is not None and close_vnd > 0:
+            result = {"close": round(close_vnd / 1000, 2), "volume": int(raw_volume) if raw_volume is not None else None}
+            _cache_set(key, result, TTL_DNSE_QUOTE)
+            return result
     return None
 
 # =====================================
@@ -1235,16 +1289,16 @@ def dnse_secdef(symbol: str):
     client = _get_dnse_client()
     if client is None:
         return _err("DNSE client chưa cấu hình (thiếu DNSE_API_KEY/SECRET)", 503)
-    try:
-        status, body = client.get_security_definition(symbol=symbol, board_id="G1", dry_run=False)
-        if status == 200 and body:
-            result = _serialize_dnse(body)
-            _dnse_cache_set(key, result, TTL_DNSE_SECDEF)
-            return result
-        return _err(f"Không tìm thấy thông tin tham chiếu cho {symbol}", 404)
-    except Exception as e:
-        logger.error(f"/dnse/secdef/{symbol}: {e}")
-        return _err(str(e))
+    status, body = _dnse_call_with_fallback(
+        client.get_security_definition, symbol=symbol, board_id="G1", dry_run=False
+    )
+    if status == 200 and body:
+        result = _serialize_dnse(body)
+        _dnse_cache_set(key, result, TTL_DNSE_SECDEF)
+        return result
+    if status == "circuit_open":
+        return _err("DNSE tạm thời không khả dụng (circuit breaker), thử lại sau", 503)
+    return _err(f"Không tìm thấy thông tin tham chiếu cho {symbol}", 404)
 
 
 @app.get("/dnse/ohlc/{symbol}")
@@ -1263,26 +1317,19 @@ def dnse_ohlc(symbol: str, resolution: str = "1", from_ts: Optional[int] = None,
     client = _get_dnse_client()
     if client is None:
         return _err("DNSE client chưa cấu hình", 503)
-    try:
-        if from_ts is None:
-            from_ts = int((datetime.now() - timedelta(days=30)).timestamp())
-        if to_ts is None:
-            to_ts = int(datetime.now().timestamp())
-        query = {
-            "symbol": symbol,
-            "resolution": resolution,
-            "from": from_ts,
-            "to": to_ts,
-        }
-        status, body = client.get_ohlc("STOCK", query, dry_run=False)
-        if status == 200 and body:
-            result = _serialize_dnse(body)
-            _dnse_cache_set(key, result, TTL_DNSE_OHLC)
-            return result
-        return _err(f"Không có dữ liệu OHLC cho {symbol}", 404)
-    except Exception as e:
-        logger.error(f"/dnse/ohlc/{symbol}: {e}")
-        return _err(str(e))
+    if from_ts is None:
+        from_ts = int((datetime.now() - timedelta(days=30)).timestamp())
+    if to_ts is None:
+        to_ts = int(datetime.now().timestamp())
+    query = {"symbol": symbol, "resolution": resolution, "from": from_ts, "to": to_ts}
+    status, body = _dnse_call_with_fallback(client.get_ohlc, "STOCK", query, dry_run=False)
+    if status == 200 and body:
+        result = _serialize_dnse(body)
+        _dnse_cache_set(key, result, TTL_DNSE_OHLC)
+        return result
+    if status == "circuit_open":
+        return _err("DNSE tạm thời không khả dụng (circuit breaker), thử lại sau", 503)
+    return _err(f"Không có dữ liệu OHLC cho {symbol}", 404)
 
 
 @app.get("/dnse/latest-trade/{symbol}")
@@ -1296,16 +1343,16 @@ def dnse_latest_trade(symbol: str):
     client = _get_dnse_client()
     if client is None:
         return _err("DNSE client chưa cấu hình", 503)
-    try:
-        status, body = client.get_latest_trade(symbol=symbol, board_id="G1", dry_run=False)
-        if status == 200 and body:
-            result = _serialize_dnse(body)
-            _dnse_cache_set(key, result, TTL_DNSE_LATEST_TRADE)
-            return result
-        return _err(f"Không có tick mới nhất cho {symbol}", 404)
-    except Exception as e:
-        logger.error(f"/dnse/latest-trade/{symbol}: {e}")
-        return _err(str(e))
+    status, body = _dnse_call_with_fallback(
+        client.get_latest_trade, symbol=symbol, board_id="G1", dry_run=False
+    )
+    if status == 200 and body:
+        result = _serialize_dnse(body)
+        _dnse_cache_set(key, result, TTL_DNSE_LATEST_TRADE)
+        return result
+    if status == "circuit_open":
+        return _err("DNSE tạm thời không khả dụng (circuit breaker), thử lại sau", 503)
+    return _err(f"Không có tick mới nhất cho {symbol}", 404)
 
 
 @app.get("/dnse/trades/{symbol}")
@@ -1324,24 +1371,23 @@ def dnse_trades(symbol: str, board_id: str = "G1", from_date: Optional[str] = No
     client = _get_dnse_client()
     if client is None:
         return _err("DNSE client chưa cấu hình", 503)
-    try:
-        if from_date is None:
-            from_date = _today()
-        if to_date is None:
-            to_date = _today()
-        status, body = client.get_trades(
-            symbol=symbol, board_id=board_id,
-            from_date=from_date, to_date=to_date,
-            limit=min(limit, 5000), order=order, dry_run=False
-        )
-        if status == 200 and body:
-            result = _serialize_dnse(body)
-            _dnse_cache_set(key, result, TTL_DNSE_TRADES)
-            return result
-        return _err(f"Không có tick data cho {symbol}", 404)
-    except Exception as e:
-        logger.error(f"/dnse/trades/{symbol}: {e}")
-        return _err(str(e))
+    if from_date is None:
+        from_date = _today()
+    if to_date is None:
+        to_date = _today()
+    status, body = _dnse_call_with_fallback(
+        client.get_trades,
+        symbol=symbol, board_id=board_id,
+        from_date=from_date, to_date=to_date,
+        limit=min(limit, 5000), order=order, dry_run=False
+    )
+    if status == 200 and body:
+        result = _serialize_dnse(body)
+        _dnse_cache_set(key, result, TTL_DNSE_TRADES)
+        return result
+    if status == "circuit_open":
+        return _err("DNSE tạm thời không khả dụng (circuit breaker), thử lại sau", 503)
+    return _err(f"Không có tick data cho {symbol}", 404)
 
 
 @app.get("/dnse/instruments")
@@ -1363,22 +1409,20 @@ def dnse_instruments(
     client = _get_dnse_client()
     if client is None:
         return _err("DNSE client chưa cấu hình", 503)
-    try:
-        params = {"limit": limit, "page": page}
-        if symbol:
-            params["symbol"] = symbol
-        if market_id:
-            params["market_id"] = market_id
-        if security_group_id:
-            params["security_group_id"] = security_group_id
-        if index_name:
-            params["index_name"] = index_name
-        status, body = client.get_instruments(dry_run=False, **params)
-        if status == 200 and body:
-            result = _serialize_dnse(body)
-            _dnse_cache_set(key, result, TTL_DNSE_INSTRUMENTS)
-            return result
-        return _err("Không tìm thấy mã phù hợp", 404)
-    except Exception as e:
-        logger.error(f"/dnse/instruments: {e}")
-        return _err(str(e))
+    params = {"limit": limit, "page": page}
+    if symbol:
+        params["symbol"] = symbol
+    if market_id:
+        params["market_id"] = market_id
+    if security_group_id:
+        params["security_group_id"] = security_group_id
+    if index_name:
+        params["index_name"] = index_name
+    status, body = _dnse_call_with_fallback(client.get_instruments, dry_run=False, **params)
+    if status == 200 and body:
+        result = _serialize_dnse(body)
+        _dnse_cache_set(key, result, TTL_DNSE_INSTRUMENTS)
+        return result
+    if status == "circuit_open":
+        return _err("DNSE tạm thời không khả dụng (circuit breaker), thử lại sau", 503)
+    return _err("Không tìm thấy mã phù hợp", 404)
