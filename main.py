@@ -124,28 +124,8 @@ _dnse_unreachable_count = 0
 _DNSE_MAX_UNREACHABLE = 3  # sau 3 lần thất bại liên tiếp, tạm ngừng gọi DNSE
 _dnse_last_success = 0
 
-def _create_dnse_http_client():
-    """Tạo httpx client với timeout dài và retry cho Render->Vietnam."""
-    import httpx
-    from httpx import Retry
-    # Tạo retry strategy: 3 lần retry, exponential backoff
-    retry = Retry(
-        total=3,
-        backoff_factor=2.0,  # 2s, 4s, 8s
-        status_forcelist=[429, 500, 502, 503, 504],
-        allowed_methods=["GET", "POST"]
-    )
-    # Timeout: connect 30s, read 60s, write 30s, pool 60s
-    timeout = httpx.Timeout(connect=30.0, read=60.0, write=30.0, pool=60.0)
-    limits = httpx.Limits(max_keepalive_connections=5, max_connections=10)
-    return httpx.Client(
-        timeout=timeout,
-        limits=limits,
-        transport=httpx.HTTPTransport(retries=retry)
-    )
-
 def _get_dnse_client():
-    """Khởi tạo DNSEClient dạng lazy singleton với httpx client tùy chỉnh."""
+    """Khởi tạo DNSEClient dạng lazy singleton. Tự retry sau interval nếu env vars được set sau."""
     global _dnse_client, _dnse_last_init_attempt
     if _dnse_client is not None:
         return _dnse_client
@@ -161,32 +141,14 @@ def _get_dnse_client():
         return None
     try:
         from dnse import DNSEClient
-        http_client = _create_dnse_http_client()
         _dnse_client = DNSEClient(
             api_key=api_key,
             api_secret=api_secret,
             base_url=os.getenv("DNSE_BASE_URL", "https://openapi.dnse.com.vn"),
             api_version=os.getenv("DNSE_API_VERSION") or None,
-            http_client=http_client  # Pass custom httpx client
         )
-        logger.info("DNSE client khởi tạo thành công (timeout 60s, retry 3x)")
+        logger.info("DNSE client khởi tạo thành công")
         return _dnse_client
-    except TypeError:
-        # DNSEClient có thể không hỗ trợ http_client param, fallback default
-        logger.warning("DNSEClient không hỗ trợ http_client tùy chỉnh, dùng mặc định")
-        try:
-            from dnse import DNSEClient
-            _dnse_client = DNSEClient(
-                api_key=api_key,
-                api_secret=api_secret,
-                base_url=os.getenv("DNSE_BASE_URL", "https://openapi.dnse.com.vn"),
-                api_version=os.getenv("DNSE_API_VERSION") or None,
-            )
-            logger.info("DNSE client khởi tạo thành công (default timeout)")
-            return _dnse_client
-        except Exception as e:
-            logger.warning(f"DNSE client init lỗi: {e}")
-            return None
     except Exception as e:
         logger.warning(f"DNSE client init lỗi: {e}")
         return None
@@ -222,6 +184,33 @@ def _dnse_call_with_fallback(call_func, *args, **kwargs):
         else:
             logger.warning(f"DNSE call lỗi: {e}")
         return None, str(e)
+
+def _dnse_get_latest_quote(symbol):
+    """
+    Lấy báo giá mới nhất từ DNSE Market Data API (get_latest_quote).
+    Trả về {"close": <nghìn đồng>, "volume": <int|None>} hoặc None nếu lỗi/không có client.
+    LƯU Ý ĐƠN VỊ: DNSE trả giá theo VND thực (vd 60500), toàn hệ thống (vnstock, GAS bot)
+    đang dùng đơn vị nghìn đồng (vd 60.5) — nên phải chia 1000 ở đây để KHÔNG phá vỡ quy ước cũ.
+    """
+    client = _get_dnse_client()
+    if client is None:
+        return None
+    key = f"dnse_quote_{symbol}"
+    cached = _cache_get(key)
+    if cached is not None:
+        return cached
+    status, body = _dnse_call_with_fallback(
+        client.get_latest_quote, symbol=symbol, board_id="G1", dry_run=False
+    )
+    if status == 200 and body:
+        raw_close = body.get("matchPrice") or body.get("closePrice") or body.get("close") or body.get("price")
+        raw_volume = body.get("matchQtty") or body.get("volume") or body.get("totalVolume")
+        close_vnd = _safe_float(raw_close)
+        if close_vnd is not None and close_vnd > 0:
+            result = {"close": round(close_vnd / 1000, 2), "volume": int(raw_volume) if raw_volume is not None else None}
+            _cache_set(key, result, TTL_DNSE_QUOTE)
+            return result
+    return None
 
 def _dnse_get_latest_quote(symbol):
     client = _get_dnse_client()
