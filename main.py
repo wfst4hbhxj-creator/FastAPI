@@ -292,26 +292,19 @@ def _bounded_vnstock_call(fn, args=(), kwargs=None, hard_timeout=10):
     """Wrapper cho vnstock calls với timeout 10s mặc định."""
     return _bounded_call(fn, args, kwargs, hard_timeout)
 
-def _fetch_funds_parallel(fund_names):
+def _fetch_funds_sequential(fund_names):
     """
-    Chạy _fetch_fund_holdings() cho nhiều quỹ CÙNG LÚC thay vì tuần tự.
-    Dùng shared executor để tránh thread exhaustion.
+    Chạy _fetch_fund_holdings() cho nhiều quỹ TUẦN TỰ — tránh crash do thread-safety.
     """
     fund_names = list(fund_names)
-    results = {fn: [] for fn in fund_names}
-    try:
-        futures = {_bounded_executor.submit(_fetch_fund_holdings, fn): fn for fn in fund_names}
-        for future in futures:
-            fn = futures[future]
-            try:
-                results[fn] = future.result(timeout=30) or []
-            except Exception as e:
-                logger.warning(f"_fetch_funds_parallel: quỹ {fn} lỗi/timeout: {e}")
-                results[fn] = []
-        return results
-    except Exception as e:
-        logger.error(f"_fetch_funds_parallel: {e}")
-        return {fn: [] for fn in fund_names}
+    results = {}
+    for fn in fund_names:
+        try:
+            results[fn] = _fetch_fund_holdings(fn) or []
+        except Exception as e:
+            logger.warning(f"_fetch_funds_sequential: quỹ {fn} lỗi: {e}")
+            results[fn] = []
+    return results
 
 def _map_sequential(items, fn, timeout_per_item=15):
     """
@@ -764,7 +757,7 @@ def get_fund_industry(symbol: str):
 @app.get("/fund-favorites")
 def get_fund_favorites():
     def _run():
-        holdings_map = _fetch_funds_parallel(["DCDS", "DCDE"])
+        holdings_map = _fetch_funds_sequential(["DCDS", "DCDE"])
         return {fn: (h[:10] if isinstance(h, list) else []) for fn, h in holdings_map.items()}
     result = _bounded_call(_run, hard_timeout=20)
     if result is None:
@@ -778,7 +771,7 @@ def get_fund_favorites():
 def get_fund_check(symbol: str):
     symbol = symbol.upper()
     held_by = []
-    holdings_map = _fetch_funds_parallel(WATCHED_FUNDS)
+    holdings_map = _fetch_funds_sequential(WATCHED_FUNDS)
     for fund_name in WATCHED_FUNDS:
         try:
             holdings = holdings_map.get(fund_name) or []
@@ -957,7 +950,7 @@ def recommend():
     # ứng viên bên dưới) — vì get_quality()->get_score()->get_fund_check() sẽ tự gọi lại
     # WATCHED_FUNDS cho MỖI mã khi chấm điểm song song ở dưới; pre-warm ở đây để N mã đó
     # đều gặp cache-hit thay vì N lệnh gọi mạng trùng lặp cùng lúc tới cùng 1 quỹ.
-    holdings_map = _fetch_funds_parallel(WATCHED_FUNDS)
+    holdings_map = _fetch_funds_sequential(WATCHED_FUNDS)
     candidates = []
     seen = set()
     for fund_name in ["DCDS", "DCDE"]:  # giữ nguyên nguồn ứng viên như code gốc — chỉ DCDS/DCDE
@@ -1124,7 +1117,7 @@ def get_index(symbol: str):
 def get_growth_stocks():
     candidates = []
     seen = set()
-    holdings_map = _fetch_funds_parallel(["DCDS", "DCDE", "DCBF"])
+    holdings_map = _fetch_funds_sequential(["DCDS", "DCDE", "DCBF"])
     
     # Collect unique symbols first
     symbols = []
@@ -1168,7 +1161,7 @@ def get_growth_stocks():
 def get_dividend_kings():
     candidates = []
     seen = set()
-    holdings_map = _fetch_funds_parallel(["DCDS", "DCDE", "DCBF"])
+    holdings_map = _fetch_funds_sequential(["DCDS", "DCDE", "DCBF"])
     
     # Collect unique symbols first
     symbols = []
