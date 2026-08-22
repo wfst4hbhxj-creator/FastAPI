@@ -571,8 +571,18 @@ def get_company(symbol: str):
     if cached is not None:
         return cached
     try:
-        # Gọi trực tiếp với timeout dài hơn, không dùng thread pool để tránh crash vnstock
-        data = Reference().company(symbol).overview()
+        # vnstock v4: CompanyReference might not have .overview() method
+        # Try multiple possible method names
+        company_ref = Reference().company(symbol)
+        data = None
+        for method_name in ['overview', 'get_overview', 'profile', 'get_profile']:
+            if hasattr(company_ref, method_name):
+                method = getattr(company_ref, method_name)
+                try:
+                    data = method() if callable(method) else method
+                    break
+                except Exception:
+                    continue
         if data is None or (hasattr(data, "empty") and data.empty):
             return _err(f"Không tìm thấy công ty {symbol}", 404)
         result = _serialize(data)
@@ -592,7 +602,16 @@ def get_dividend(symbol: str):
     if cached is not None:
         return cached
     try:
-        events = Reference().company(symbol).events()
+        company_ref = Reference().company(symbol)
+        events = None
+        for method_name in ['events', 'get_events', 'news', 'get_news']:
+            if hasattr(company_ref, method_name):
+                method = getattr(company_ref, method_name)
+                try:
+                    events = method() if callable(method) else method
+                    break
+                except Exception:
+                    continue
         if events is not None and not events.empty:
             div_mask = events.apply(
                 lambda r: any(kw in str(r).lower() for kw in ["cổ tức","dividend","chi tra","cash"]),
@@ -908,8 +927,16 @@ def get_hold(symbol: str):
             pass
         events_data = None
         try:
-            # Gọi trực tiếp, không dùng thread pool
-            ev = Reference().company(symbol).events()
+            company_ref = Reference().company(symbol)
+            ev = None
+            for method_name in ['events', 'get_events', 'news', 'get_news']:
+                if hasattr(company_ref, method_name):
+                    method = getattr(company_ref, method_name)
+                    try:
+                        ev = method() if callable(method) else method
+                        break
+                    except Exception:
+                        continue
             if ev is not None and not ev.empty:
                 events_data = _serialize(ev.head(5))
         except Exception:
@@ -1015,17 +1042,16 @@ def get_news(symbol: str):
     if cached is not None:
         return cached
     try:
-        ref = Reference()
+        company_ref = Reference().company(symbol)
         news_data = None
-        try:
-            news_data = ref.company(symbol).news()
-        except Exception:
-            pass
-        if news_data is None or (hasattr(news_data, "empty") and news_data.empty):
-            try:
-                news_data = ref.company(symbol).events()
-            except Exception:
-                pass
+        for method_name in ['news', 'get_news', 'events', 'get_events']:
+            if hasattr(company_ref, method_name):
+                method = getattr(company_ref, method_name)
+                try:
+                    news_data = method() if callable(method) else method
+                    break
+                except Exception:
+                    continue
         if news_data is None or (hasattr(news_data, "empty") and news_data.empty):
             return _err(f"Không có tin tức cho {symbol}", 404)
         records = _serialize(news_data)
