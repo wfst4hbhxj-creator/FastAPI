@@ -9,15 +9,163 @@ function getConfig() {
     GEMINI_API_KEY: props.getProperty('GEMINI_API_KEY'),
     GROQ_API_KEY: props.getProperty('GROQ_API_KEY'),
     API_BASE: props.getProperty('API_BASE') || 'https://fastapi-3k2j.onrender.com',
-    GEMINI_MODEL: 'gemini-2.5-flash-lite',
-    GROQ_MODEL: 'openai/gpt-oss-20b'
+    GEMINI_MODEL: props.getProperty('GEMINI_MODEL') || '',
+    GROQ_MODEL: props.getProperty('GROQ_MODEL') || ''
   };
+}
+
+// =====================================
+// 🤖 AUTO MODEL DETECTION — Tự động chọn model tốt nhất
+// =====================================
+
+/**
+ * Lấy danh sách model khả dụng từ Gemini API
+ * Trả về model tốt nhất cho free tier (ưu tiên flash-lite, flash, sau đó pro)
+ */
+function detectBestGeminiModel() {
+  const apiKey = cfg('GEMINI_API_KEY');
+  if (!apiKey || apiKey.startsWith('PASTE_')) return 'gemini-2.5-flash-lite';
+  
+  try {
+    const res = UrlFetchApp.fetch(
+      'https://generativelanguage.googleapis.com/v1beta/models?key=' + apiKey,
+      { method: 'get', muteHttpExceptions: true, timeout: 10 }
+    );
+    if (res.getResponseCode() !== 200) {
+      Logger.log('Gemini list models failed: ' + res.getContentText());
+      return 'gemini-2.5-flash-lite';
+    }
+    const data = JSON.parse(res.getContentText());
+    const models = (data.models || []).map(m => m.name.replace('models/', ''));
+    
+    // Thứ tự ưu tiên cho free tier (tối ưu chi phí & tốc độ)
+    const priority = [
+      'gemini-2.5-flash-lite',  // mới nhất, rẻ nhất, nhanh
+      'gemini-2.5-flash',       // cân bằng
+      'gemini-2.0-flash-lite',  // backup
+      'gemini-2.0-flash',       // backup
+      'gemini-1.5-flash-latest', // legacy
+      'gemini-1.5-flash-8b',    // nhỏ gọn
+      'gemini-1.5-pro-latest',  // fallback cuối
+    ];
+    
+    for (const m of priority) {
+      if (models.includes(m)) {
+        Logger.log('✅ Gemini model selected: ' + m);
+        return m;
+      }
+    }
+    // Fallback: model đầu tiên có chứa flash
+    const flashModel = models.find(m => m.includes('flash'));
+    if (flashModel) return flashModel;
+    
+    return 'gemini-2.5-flash-lite';
+  } catch (e) {
+    Logger.log('detectBestGeminiModel error: ' + e);
+    return 'gemini-2.5-flash-lite';
+  }
+}
+
+/**
+ * Lấy danh sách model khả dụng từ Groq API
+ * Trả về model tốt nhất cho free tier (ưu tiên gpt-oss-20b, llama-3.1-8b, etc.)
+ */
+function detectBestGroqModel() {
+  const apiKey = cfg('GROQ_API_KEY');
+  if (!apiKey || apiKey.startsWith('PASTE_')) return 'openai/gpt-oss-20b';
+  
+  try {
+    const res = UrlFetchApp.fetch('https://api.groq.com/openai/v1/models', {
+      method: 'get',
+      headers: { 'Authorization': 'Bearer ' + apiKey },
+      muteHttpExceptions: true,
+      timeout: 10
+    });
+    if (res.getResponseCode() !== 200) {
+      Logger.log('Groq list models failed: ' + res.getContentText());
+      return 'openai/gpt-oss-20b';
+    }
+    const data = JSON.parse(res.getContentText());
+    const models = (data.data || []).map(m => m.id);
+    
+    // Thứ tự ưu tiên cho free tier (miễn phí, nhanh, chất lượng tốt)
+    const priority = [
+      'openai/gpt-oss-20b',        // miễn phí, reasoning tốt
+      'llama-3.3-70b-versatile',   // chất lượng cao
+      'llama-3.1-70b-versatile',   // backup
+      'llama-3.1-8b-instant',      // rất nhanh
+      'gemma2-9b-it',              // nhỏ gọn
+      'mixtral-8x7b-32768',        // legacy
+    ];
+    
+    for (const m of priority) {
+      if (models.includes(m)) {
+        Logger.log('✅ Groq model selected: ' + m);
+        return m;
+      }
+    }
+    // Fallback: model đầu tiên
+    return models[0] || 'openai/gpt-oss-20b';
+  } catch (e) {
+    Logger.log('detectBestGroqModel error: ' + e);
+    return 'openai/gpt-oss-20b';
+  }
+}
+
+/**
+ * Khởi tạo/ cập nhật model tự động - gọi 1 lần khi deploy hoặc khi key thay đổi
+ */
+function autoDetectAndSaveModels() {
+  const props = PropertiesService.getScriptProperties();
+  
+  // Chỉ detect khi chưa có model hoặc key mới
+  const currentGemini = props.getProperty('GEMINI_MODEL');
+  const currentGroq = props.getProperty('GROQ_MODEL');
+  const geminiKey = props.getProperty('GEMINI_API_KEY');
+  const groqKey = props.getProperty('GROQ_API_KEY');
+  
+  let updated = false;
+  
+  if (!currentGemini || currentGemini.startsWith('PASTE_') || geminiKey !== props.getProperty('_LAST_GEMINI_KEY')) {
+    const bestGemini = detectBestGeminiModel();
+    props.setProperty('GEMINI_MODEL', bestGemini);
+    props.setProperty('_LAST_GEMINI_KEY', geminiKey || '');
+    updated = true;
+    Logger.log('🔄 Updated GEMINI_MODEL to: ' + bestGemini);
+  }
+  
+  if (!currentGroq || currentGroq.startsWith('PASTE_') || groqKey !== props.getProperty('_LAST_GROQ_KEY')) {
+    const bestGroq = detectBestGroqModel();
+    props.setProperty('GROQ_MODEL', bestGroq);
+    props.setProperty('_LAST_GROQ_KEY', groqKey || '');
+    updated = true;
+    Logger.log('🔄 Updated GROQ_MODEL to: ' + bestGroq);
+  }
+  
+  if (updated) {
+    _configCache = null; // clear cache
+    Logger.log('✅ Auto model detection completed');
+  } else {
+    Logger.log('✅ Models already up to date');
+  }
+  
+  return { gemini: props.getProperty('GEMINI_MODEL'), groq: props.getProperty('GROQ_MODEL') };
 }
 
 // Helper lấy config cache để tránh đọc PropertiesService nhiều lần
 let _configCache = null;
+let _modelsDetected = false;
+
 function cfg(key) {
   if (!_configCache) _configCache = getConfig();
+  
+  // Auto-detect models on first access
+  if (!_modelsDetected && (key === 'GEMINI_MODEL' || key === 'GROQ_MODEL')) {
+    autoDetectAndSaveModels();
+    _configCache = getConfig(); // refresh cache
+    _modelsDetected = true;
+  }
+  
   return _configCache[key];
 }
 
@@ -34,6 +182,9 @@ function setupSecrets() {
     'API_BASE': 'https://fastapi-3k2j.onrender.com'
   });
   Logger.log('✅ Secrets đã lưu vào PropertiesService — NHỚ ĐIỀN GIÁ TRỊ THẬT VÀO TRƯỚC KHI CHẠY!');
+  
+  // Trigger auto model detection after saving secrets
+  autoDetectAndSaveModels();
 }
 
 // =====================================
