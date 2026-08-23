@@ -199,14 +199,14 @@ def _vnstock_quick_call(call_func, *args, **kwargs):
     - Không có circuit breaker (vnstock ổn định hơn)
     - Return (result) hoặc (None, error)
     """
-    logger.info(f"vnstock_quick_call: starting call_func={call_func.__name__ if hasattr(call_func, '__name__') else call_func}")
+    logger.info(f"vnstock_quick_call: starting call_func={call_func.__name__ if hasattr(call_func, '__name__') else call_func}, args={args}, kwargs={kwargs}")
     future = _bounded_executor.submit(call_func, *args, **kwargs)
     try:
         result = future.result(timeout=_VNSTOCK_QUICK_TIMEOUT)
-        logger.info(f"vnstock_quick_call: completed successfully")
+        logger.info(f"vnstock_quick_call: completed successfully, result type={type(result)}")
         return result, None
     except Exception as e:
-        logger.warning(f"vnstock call lỗi/timeout: {e}")
+        logger.exception(f"vnstock call lỗi/timeout: {e}")
         return None, str(e)
 
 def _dnse_get_latest_quote(symbol):
