@@ -237,6 +237,7 @@ def _dnse_get_latest_quote(symbol):
     # Fallback vnstock qua endpoint /stock (có timeout)
     try:
         quote, err = _vnstock_quick_call(_get_vnstock_quote, symbol)
+        logger.info(f"_dnse_get_latest_quote fallback: symbol={symbol}, quote={quote}, err={err}")
         if err is None and quote and quote.get("close"):
             result = {"close": quote["close"], "volume": quote.get("volume")}
             _cache_set(key, result, TTL_DNSE_QUOTE)
@@ -244,7 +245,7 @@ def _dnse_get_latest_quote(symbol):
         if err:
             logger.warning(f"Fallback vnstock get_latest_quote lỗi: {err}")
     except Exception as e:
-        logger.warning(f"Fallback vnstock get_latest_quote lỗi: {e}")
+        logger.exception(f"Fallback vnstock get_latest_quote exception: {e}")
     return None
 
 
@@ -1420,12 +1421,14 @@ def dnse_latest_trade(symbol: str):
     # Fallback vnstock - lấy giá từ /stock endpoint
     try:
         quote = _dnse_get_latest_quote(symbol)
-        logger.info(f"vnstock latest-trade fallback: symbol={symbol}, quote={quote}")
+        logger.info(f"vnstock latest-trade fallback: symbol={symbol}, quote={quote}, type={type(quote)}")
         if quote and quote.get("close"):
             result = {"matchPrice": quote["close"] * 1000, "matchQtty": quote.get("volume")}
             result = _serialize_dnse([result])[0]
             _dnse_cache_set(key, result, TTL_DNSE_LATEST_TRADE)
             return result
+        else:
+            logger.warning(f"Fallback vnstock latest-trade: quote is None or missing close: {quote}")
     except Exception as e:
         logger.exception(f"Fallback vnstock latest-trade exception: {e}")
     
