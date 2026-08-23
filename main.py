@@ -1350,17 +1350,17 @@ def dnse_ohlc(symbol: str, resolution: str = "1", from_ts: Optional[int] = None,
         interval_map = {"1": "1m", "5": "5m", "15": "15m", "60": "1H", "D": "1D"}
         vn_interval = interval_map.get(resolution, "1D")
         quote = Market().equity(symbol).ohlcv(start=_days_ago(5), end=_today(), interval=vn_interval)
-        logger.info(f"vnstock OHLC fallback: symbol={symbol}, interval={vn_interval}, rows={len(quote) if quote is not None else 0}")
+        logger.info(f"vnstock OHLC fallback: symbol={symbol}, interval={vn_interval}, rows={len(quote) if quote is not None else 0}, empty={quote.empty if quote is not None else True}")
         if quote is not None and not quote.empty:
             result = _serialize_dnse(quote.tail(limit))
             _dnse_cache_set(key, result, TTL_DNSE_OHLC)
             return result
     except Exception as e:
-        logger.warning(f"Fallback vnstock OHLC lỗi: {e}")
+        logger.exception(f"Fallback vnstock OHLC exception: {e}")
     
     if cached is not None:
         return cached
-    return _err(f"Không có dữ liệu OHLC cho {symbol} (DNSE & vnstock đều fail) - check logs", 503)
+    return _err(f"Không có dữ liệu OHLC cho {symbol} (DNSE & vnstock đều fail) - check logs for details", 503)
 
 
 @app.get("/dnse/latest-trade/{symbol}")
@@ -1383,7 +1383,7 @@ def dnse_latest_trade(symbol: str):
             _dnse_cache_set(key, result, TTL_DNSE_LATEST_TRADE)
             return result
     
-    # Fallback vnstock - lấy giá từ /stock endpoint (có timeout)
+    # Fallback vnstock - lấy giá từ /stock endpoint
     try:
         quote = _dnse_get_latest_quote(symbol)
         logger.info(f"vnstock latest-trade fallback: symbol={symbol}, quote={quote}")
@@ -1393,7 +1393,7 @@ def dnse_latest_trade(symbol: str):
             _dnse_cache_set(key, result, TTL_DNSE_LATEST_TRADE)
             return result
     except Exception as e:
-        logger.warning(f"Fallback vnstock latest-trade lỗi: {e}")
+        logger.exception(f"Fallback vnstock latest-trade exception: {e}")
     
     if cached is not None:
         return cached
@@ -1483,7 +1483,7 @@ def dnse_instruments(
             _dnse_cache_set(key, result, TTL_DNSE_INSTRUMENTS)
             return result
     except Exception as e:
-        logger.warning(f"Fallback vnstock listing lỗi: {e}")
+        logger.exception(f"Fallback vnstock listing exception: {e}")
     
     if cached is not None:
         return cached
