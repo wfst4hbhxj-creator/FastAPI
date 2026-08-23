@@ -1350,16 +1350,12 @@ def dnse_ohlc(symbol: str, resolution: str = "1", from_ts: Optional[int] = None,
     try:
         interval_map = {"1": "1m", "5": "5m", "15": "15m", "60": "1H", "D": "1D"}
         vn_interval = interval_map.get(resolution, "1D")
-        # Dùng 5 ngày thay vì 30 ngày để nhanh hơn, giống /stock endpoint
-        quote, err = _vnstock_quick_call(
-            Market().equity(symbol).ohlcv, start=_days_ago(5), end=_today(), interval=vn_interval
-        )
-        if err is None and quote is not None and not quote.empty:
+        # Gọi vnstock trực tiếp như /stock endpoint (đã chạy trong thread pool của FastAPI)
+        quote = Market().equity(symbol).ohlcv(start=_days_ago(5), end=_today(), interval=vn_interval)
+        if quote is not None and not quote.empty:
             result = _serialize_dnse(quote.tail(limit))
             _dnse_cache_set(key, result, TTL_DNSE_OHLC)
             return result
-        if err:
-            logger.warning(f"Fallback vnstock OHLC lỗi: {err}")
     except Exception as e:
         logger.warning(f"Fallback vnstock OHLC lỗi: {e}")
     
@@ -1390,14 +1386,12 @@ def dnse_latest_trade(symbol: str):
     
     # Fallback vnstock - lấy giá từ /stock endpoint (có timeout)
     try:
-        quote, err = _vnstock_quick_call(_dnse_get_latest_quote, symbol)
-        if err is None and quote and quote.get("close"):
+        quote = _dnse_get_latest_quote(symbol)
+        if quote and quote.get("close"):
             result = {"matchPrice": quote["close"] * 1000, "matchQtty": quote.get("volume")}
             result = _serialize_dnse([result])[0]
             _dnse_cache_set(key, result, TTL_DNSE_LATEST_TRADE)
             return result
-        if err:
-            logger.warning(f"Fallback vnstock latest-trade lỗi: {err}")
     except Exception as e:
         logger.warning(f"Fallback vnstock latest-trade lỗi: {e}")
     
@@ -1480,15 +1474,13 @@ def dnse_instruments(
             _dnse_cache_set(key, result, TTL_DNSE_INSTRUMENTS)
             return result
     
-    # Fallback vnstock Reference().listing() (có timeout)
+    # Fallback vnstock Reference().listing()
     try:
-        listing, err = _vnstock_quick_call(Reference().listing)
-        if err is None and listing is not None and not listing.empty:
+        listing = Reference().listing()
+        if listing is not None and not listing.empty:
             result = _serialize_dnse(listing)
             _dnse_cache_set(key, result, TTL_DNSE_INSTRUMENTS)
             return result
-        if err:
-            logger.warning(f"Fallback vnstock listing lỗi: {err}")
     except Exception as e:
         logger.warning(f"Fallback vnstock listing lỗi: {e}")
     
