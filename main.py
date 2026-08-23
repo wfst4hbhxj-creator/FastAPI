@@ -1280,7 +1280,7 @@ def get_dividend_kings():
 # ===== DNSE MARKET DATA API =====
 
 TTL_DNSE_SECDEF = 24 * 3600  # 24h - tham chiếu mã ít thay đổi
-TTL_DNSE_OHLC = 60  # 1 phút - OHLC realtime
+TTL_DNSE_OHLC = 300  # 5 phút - OHLC cache lâu hơn vì DNSE hay fail
 TTL_DNSE_TRADES = 60  # 1 phút - tick data
 TTL_DNSE_LATEST_TRADE = 10  # 10 giây - giá khớp mới nhất
 TTL_DNSE_INSTRUMENTS = 3600  # 1h - danh sách mã
@@ -1365,13 +1365,18 @@ def dnse_ohlc(symbol: str, resolution: str = "1", from_ts: Optional[int] = None,
         to_ts = int(datetime.now().timestamp())
     query = {"symbol": symbol, "resolution": resolution, "from": from_ts, "to": to_ts}
     
-    # Thử DNSE trước
+    # Thử DNSE trước (timeout nhanh 3s)
+    dnse_success = False
     if client is not None:
         status, body = _dnse_quick_call(client.get_ohlc, "STOCK", query, dry_run=False)
         if status == 200 and body:
             result = _serialize_dnse(body)
             _dnse_cache_set(key, result, TTL_DNSE_OHLC)
+            dnse_success = True
             return result
+    
+    if dnse_success:
+        return result
     
     # Fallback vnstock - gọi trực tiếp như /stock endpoint
     try:
