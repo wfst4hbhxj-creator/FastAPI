@@ -1106,6 +1106,7 @@ def get_news(symbol: str):
 @app.get("/test/vnstock/{symbol}")
 def test_vnstock(symbol: str):
     """Test endpoint to debug vnstock calls."""
+    import pandas as pd
     symbol = symbol.upper()
     try:
         quote = Market().equity(symbol).ohlcv(start=_days_ago(5), end=_today(), interval="1D")
