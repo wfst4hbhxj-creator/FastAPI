@@ -1420,6 +1420,7 @@ def dnse_latest_trade(symbol: str):
     
     # Fallback vnstock - lấy giá từ /stock endpoint
     try:
+        logger.info(f"Calling _dnse_get_latest_quote for symbol={symbol}")
         quote = _dnse_get_latest_quote(symbol)
         logger.info(f"vnstock latest-trade fallback: symbol={symbol}, quote={quote}, type={type(quote)}")
         if quote and quote.get("close"):
