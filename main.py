@@ -1290,13 +1290,16 @@ def dnse_secdef(symbol: str):
         return result
     if status == "circuit_open":
         return _err("DNSE tạm thời không khả dụng (circuit breaker), thử lại sau", 503)
-    return _err(f"Không tìm thấy thông tin tham chiếu cho {symbol}", 404)
+    # Fallback: trả cache cũ nếu có
+    if cached is not None:
+        return cached
+    return _err(f"DNSE không khả dụng, không có cache cho {symbol}", 503)
 
 
 @app.get("/dnse/ohlc/{symbol}")
 def dnse_ohlc(symbol: str, resolution: str = "1", from_ts: Optional[int] = None, to_ts: Optional[int] = None, limit: int = 500):
     """
-    Lấy nến OHLC từ DNSE.
+    Lấy nến OHLC từ DNSE (có fallback vnstock).
     resolution: "1" (1m), "5" (5m), "15" (15m), "60" (1H), "D" (1D)
     from_ts/to_ts: Unix timestamp (mặc định 30 ngày gần nhất)
     limit: số lượng nến tối đa
@@ -1307,50 +1310,77 @@ def dnse_ohlc(symbol: str, resolution: str = "1", from_ts: Optional[int] = None,
     if cached is not None:
         return cached
     client = _get_dnse_client()
-    if client is None:
-        return _err("DNSE client chưa cấu hình", 503)
     if from_ts is None:
         from_ts = int((datetime.now() - timedelta(days=30)).timestamp())
     if to_ts is None:
         to_ts = int(datetime.now().timestamp())
     query = {"symbol": symbol, "resolution": resolution, "from": from_ts, "to": to_ts}
-    status, body = _dnse_quick_call(client.get_ohlc, "STOCK", query, dry_run=False)
-    if status == 200 and body:
-        result = _serialize_dnse(body)
-        _dnse_cache_set(key, result, TTL_DNSE_OHLC)
-        return result
-    if status == "circuit_open":
-        return _err("DNSE tạm thời không khả dụng (circuit breaker), thử lại sau", 503)
-    return _err(f"Không có dữ liệu OHLC cho {symbol}", 404)
+    
+    # Thử DNSE trước
+    if client is not None:
+        status, body = _dnse_quick_call(client.get_ohlc, "STOCK", query, dry_run=False)
+        if status == 200 and body:
+            result = _serialize_dnse(body)
+            _dnse_cache_set(key, result, TTL_DNSE_OHLC)
+            return result
+    
+    # Fallback vnstock
+    try:
+        interval_map = {"1": "1m", "5": "5m", "15": "15m", "60": "1H", "D": "1D"}
+        vn_interval = interval_map.get(resolution, "1D")
+        quote = Market().equity(symbol).ohlcv(start=_days_ago(30), end=_today(), interval=vn_interval)
+        if quote is not None and not quote.empty:
+            result = _serialize_dnse(quote.tail(limit))
+            _dnse_cache_set(key, result, TTL_DNSE_OHLC)
+            return result
+    except Exception as e:
+        logger.warning(f"Fallback vnstock OHLC lỗi: {e}")
+    
+    if cached is not None:
+        return cached
+    return _err(f"Không có dữ liệu OHLC cho {symbol} (DNSE & vnstock đều fail)", 503)
 
 
 @app.get("/dnse/latest-trade/{symbol}")
 def dnse_latest_trade(symbol: str):
-    """Lấy giá khớp lệnh mới nhất (tick realtime) từ DNSE."""
+    """Lấy giá khớp lệnh mới nhất (tick realtime) từ DNSE (có fallback vnstock)."""
     symbol = symbol.upper()
     key = f"dnse_latest_trade_{symbol}"
     cached = _dnse_cache_get(key, TTL_DNSE_LATEST_TRADE)
     if cached is not None:
         return cached
     client = _get_dnse_client()
-    if client is None:
-        return _err("DNSE client chưa cấu hình", 503)
-    status, body = _dnse_quick_call(
-        client.get_latest_trade, symbol=symbol, board_id="G1", dry_run=False
-    )
-    if status == 200 and body:
-        result = _serialize_dnse(body)
-        _dnse_cache_set(key, result, TTL_DNSE_LATEST_TRADE)
-        return result
-    if status == "circuit_open":
-        return _err("DNSE tạm thời không khả dụng (circuit breaker), thử lại sau", 503)
-    return _err(f"Không có tick mới nhất cho {symbol}", 404)
+    
+    # Thử DNSE trước
+    if client is not None:
+        status, body = _dnse_quick_call(
+            client.get_latest_trade, symbol=symbol, board_id="G1", dry_run=False
+        )
+        if status == 200 and body:
+            result = _serialize_dnse(body)
+            _dnse_cache_set(key, result, TTL_DNSE_LATEST_TRADE)
+            return result
+    
+    # Fallback vnstock - lấy giá từ /stock endpoint
+    try:
+        quote = _dnse_get_latest_quote(symbol)
+        if quote and quote.get("close"):
+            result = {"matchPrice": quote["close"] * 1000, "matchQtty": quote.get("volume")}
+            result = _serialize_dnse([result])[0]
+            _dnse_cache_set(key, result, TTL_DNSE_LATEST_TRADE)
+            return result
+    except Exception as e:
+        logger.warning(f"Fallback vnstock latest-trade lỗi: {e}")
+    
+    if cached is not None:
+        return cached
+    return _err(f"Không có tick mới nhất cho {symbol} (DNSE & vnstock đều fail)", 503)
 
 
 @app.get("/dnse/trades/{symbol}")
 def dnse_trades(symbol: str, board_id: str = "G1", from_date: Optional[str] = None, to_date: Optional[str] = None, limit: int = 1000, order: str = "DESC"):
     """
-    Lấy lịch sử tick (time & sales) từ DNSE.
+    Lấy lịch sử tick (time & sales) từ DNSE (có fallback vnstock OHLC).
     from_date/to_date: format "YYYY-MM-DD" (mặc định hôm nay)
     limit: tối đa 5000
     order: "ASC" hoặc "DESC"
@@ -1361,25 +1391,28 @@ def dnse_trades(symbol: str, board_id: str = "G1", from_date: Optional[str] = No
     if cached is not None:
         return cached
     client = _get_dnse_client()
-    if client is None:
-        return _err("DNSE client chưa cấu hình", 503)
-    if from_date is None:
-        from_date = _today()
-    if to_date is None:
-        to_date = _today()
-    status, body = _dnse_quick_call(
-        client.get_trades,
-        symbol=symbol, board_id=board_id,
-        from_date=from_date, to_date=to_date,
-        limit=min(limit, 5000), order=order, dry_run=False
-    )
-    if status == 200 and body:
-        result = _serialize_dnse(body)
-        _dnse_cache_set(key, result, TTL_DNSE_TRADES)
-        return result
-    if status == "circuit_open":
-        return _err("DNSE tạm thời không khả dụng (circuit breaker), thử lại sau", 503)
-    return _err(f"Không có tick data cho {symbol}", 404)
+    
+    # Thử DNSE trước
+    if client is not None:
+        if from_date is None:
+            from_date = _today()
+        if to_date is None:
+            to_date = _today()
+        status, body = _dnse_quick_call(
+            client.get_trades,
+            symbol=symbol, board_id=board_id,
+            from_date=from_date, to_date=to_date,
+            limit=min(limit, 5000), order=order, dry_run=False
+        )
+        if status == 200 and body:
+            result = _serialize_dnse(body)
+            _dnse_cache_set(key, result, TTL_DNSE_TRADES)
+            return result
+    
+    # Fallback: không có tick data từ vnstock, trả cache nếu có
+    if cached is not None:
+        return cached
+    return _err(f"Không có tick data cho {symbol} (DNSE unreachable, vnstock không có tick data)", 503)
 
 
 @app.get("/dnse/instruments")
@@ -1393,28 +1426,41 @@ def dnse_instruments(
 ):
     """
     Tìm kiếm mã chứng khoán theo filter: symbol, market, group, index (VN30, HNX30...).
+    Fallback: vnstock Reference().listing()
     """
     key = f"dnse_instruments_{symbol}_{market_id}_{security_group_id}_{index_name}_{limit}_{page}"
     cached = _dnse_cache_get(key, TTL_DNSE_INSTRUMENTS)
     if cached is not None:
         return cached
     client = _get_dnse_client()
-    if client is None:
-        return _err("DNSE client chưa cấu hình", 503)
-    params = {"limit": limit, "page": page}
-    if symbol:
-        params["symbol"] = symbol
-    if market_id:
-        params["market_id"] = market_id
-    if security_group_id:
-        params["security_group_id"] = security_group_id
-    if index_name:
-        params["index_name"] = index_name
-    status, body = _dnse_quick_call(client.get_instruments, dry_run=False, **params)
-    if status == 200 and body:
-        result = _serialize_dnse(body)
-        _dnse_cache_set(key, result, TTL_DNSE_INSTRUMENTS)
-        return result
-    if status == "circuit_open":
-        return _err("DNSE tạm thời không khả dụng (circuit breaker), thử lại sau", 503)
-    return _err("Không tìm thấy mã phù hợp", 404)
+    
+    # Thử DNSE trước
+    if client is not None:
+        params = {"limit": limit, "page": page}
+        if symbol:
+            params["symbol"] = symbol
+        if market_id:
+            params["market_id"] = market_id
+        if security_group_id:
+            params["security_group_id"] = security_group_id
+        if index_name:
+            params["index_name"] = index_name
+        status, body = _dnse_quick_call(client.get_instruments, dry_run=False, **params)
+        if status == 200 and body:
+            result = _serialize_dnse(body)
+            _dnse_cache_set(key, result, TTL_DNSE_INSTRUMENTS)
+            return result
+    
+    # Fallback vnstock Reference().listing()
+    try:
+        listing = Reference().listing()
+        if listing is not None and not listing.empty:
+            result = _serialize_dnse(listing)
+            _dnse_cache_set(key, result, TTL_DNSE_INSTRUMENTS)
+            return result
+    except Exception as e:
+        logger.warning(f"Fallback vnstock listing lỗi: {e}")
+    
+    if cached is not None:
+        return cached
+    return _err("Không tìm thấy mã phù hợp (DNSE & vnstock đều fail)", 503)
