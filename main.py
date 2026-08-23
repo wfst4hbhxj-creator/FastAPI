@@ -238,8 +238,9 @@ def _dnse_get_latest_quote(symbol):
     
     # Fallback vnstock qua endpoint /stock (có timeout)
     try:
+        logger.info(f"_dnse_get_latest_quote: calling _vnstock_quick_call for symbol={symbol}")
         quote, err = _vnstock_quick_call(_get_vnstock_quote, symbol)
-        logger.info(f"_dnse_get_latest_quote fallback: symbol={symbol}, quote={quote}, err={err}")
+        logger.info(f"_dnse_get_latest_quote fallback: symbol={symbol}, quote={quote}, err={err}, type={type(quote)}")
         if err is None and quote and quote.get("close"):
             result = {"close": quote["close"], "volume": quote.get("volume")}
             _cache_set(key, result, TTL_DNSE_QUOTE)
