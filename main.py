@@ -190,7 +190,7 @@ def _dnse_quick_call(call_func, *args, **kwargs):
             logger.warning(f"DNSE call lỗi: {e}")
         return None, str(e)
 
-_VNSTOCK_QUICK_TIMEOUT = 30  # giây - timeout cho vnstock calls (vnstock chậm hơn DNSE, server Render Singapore->Vietnam chậm)
+_VNSTOCK_QUICK_TIMEOUT = 60  # giây - timeout cho vnstock calls (vnstock chậm hơn DNSE, server Render Singapore->Vietnam chậm)
 
 def _vnstock_quick_call(call_func, *args, **kwargs):
     """
