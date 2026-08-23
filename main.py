@@ -1312,10 +1312,9 @@ def dnse_secdef(symbol: str):
         return result
     if status == "circuit_open":
         return _err("DNSE tạm thời không khả dụng (circuit breaker), thử lại sau", 503)
-    # Fallback: trả cache cũ nếu có
     if cached is not None:
         return cached
-    return _err(f"DNSE không khả dụng, không có cache cho {symbol}", 503)
+    return _err(f"DNSE không khả dụng, không có cache cho {symbol} - check logs", 503)
 
 
 @app.get("/dnse/ohlc/{symbol}")
@@ -1361,7 +1360,7 @@ def dnse_ohlc(symbol: str, resolution: str = "1", from_ts: Optional[int] = None,
     
     if cached is not None:
         return cached
-    return _err(f"Không có dữ liệu OHLC cho {symbol} (DNSE & vnstock đều fail)", 503)
+    return _err(f"Không có dữ liệu OHLC cho {symbol} (DNSE & vnstock đều fail) - check logs", 503)
 
 
 @app.get("/dnse/latest-trade/{symbol}")
@@ -1398,7 +1397,7 @@ def dnse_latest_trade(symbol: str):
     
     if cached is not None:
         return cached
-    return _err(f"Không có tick mới nhất cho {symbol} (DNSE & vnstock đều fail)", 503)
+    return _err(f"Không có tick mới nhất cho {symbol} (DNSE & vnstock đều fail) - check logs", 503)
 
 
 @app.get("/dnse/trades/{symbol}")
@@ -1436,7 +1435,7 @@ def dnse_trades(symbol: str, board_id: str = "G1", from_date: Optional[str] = No
     # Fallback: không có tick data từ vnstock, trả cache nếu có
     if cached is not None:
         return cached
-    return _err(f"Không có tick data cho {symbol} (DNSE unreachable, vnstock không có tick data)", 503)
+    return _err(f"Không có tick data cho {symbol} (DNSE unreachable, vnstock không có tick data) - check logs", 503)
 
 
 @app.get("/dnse/instruments")
@@ -1488,4 +1487,4 @@ def dnse_instruments(
     
     if cached is not None:
         return cached
-    return _err("Không tìm thấy mã phù hợp (DNSE & vnstock đều fail)", 503)
+    return _err("Không tìm thấy mã phù hợp (DNSE & vnstock đều fail) - check logs", 503)
