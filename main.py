@@ -1346,12 +1346,12 @@ def dnse_ohlc(symbol: str, resolution: str = "1", from_ts: Optional[int] = None,
             _dnse_cache_set(key, result, TTL_DNSE_OHLC)
             return result
     
-    # Fallback vnstock (có timeout) - dùng 5 ngày như /stock endpoint để nhanh hơn
+    # Fallback vnstock - gọi trực tiếp như /stock endpoint
     try:
         interval_map = {"1": "1m", "5": "5m", "15": "15m", "60": "1H", "D": "1D"}
         vn_interval = interval_map.get(resolution, "1D")
-        # Gọi vnstock trực tiếp như /stock endpoint (đã chạy trong thread pool của FastAPI)
         quote = Market().equity(symbol).ohlcv(start=_days_ago(5), end=_today(), interval=vn_interval)
+        logger.info(f"vnstock OHLC fallback: symbol={symbol}, interval={vn_interval}, rows={len(quote) if quote is not None else 0}")
         if quote is not None and not quote.empty:
             result = _serialize_dnse(quote.tail(limit))
             _dnse_cache_set(key, result, TTL_DNSE_OHLC)
@@ -1387,6 +1387,7 @@ def dnse_latest_trade(symbol: str):
     # Fallback vnstock - lấy giá từ /stock endpoint (có timeout)
     try:
         quote = _dnse_get_latest_quote(symbol)
+        logger.info(f"vnstock latest-trade fallback: symbol={symbol}, quote={quote}")
         if quote and quote.get("close"):
             result = {"matchPrice": quote["close"] * 1000, "matchQtty": quote.get("volume")}
             result = _serialize_dnse([result])[0]
@@ -1477,6 +1478,7 @@ def dnse_instruments(
     # Fallback vnstock Reference().listing()
     try:
         listing = Reference().listing()
+        logger.info(f"vnstock listing fallback: rows={len(listing) if listing is not None else 0}")
         if listing is not None and not listing.empty:
             result = _serialize_dnse(listing)
             _dnse_cache_set(key, result, TTL_DNSE_INSTRUMENTS)
