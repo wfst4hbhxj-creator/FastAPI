@@ -213,6 +213,7 @@ def _dnse_get_latest_quote(symbol):
     Trả về {"close": <nghìn đồng>, "volume": <int|None>} hoặc None nếu lỗi/không có client.
     LƯU Ý ĐƠN VỊ: DNSE trả giá theo VND thực (vd 60500), toàn hệ thống (vnstock, GAS bot)
     đang dùng đơn vị nghìn đồng (vd 60.5) — nên phải chia 1000 ở đây để KHÔNG phá vỡ quy ước cũ.
+    Có fallback vnstock qua endpoint /stock.
     """
     client = _get_dnse_client()
     if client is None:
@@ -232,25 +233,29 @@ def _dnse_get_latest_quote(symbol):
             result = {"close": round(close_vnd / 1000, 2), "volume": int(raw_volume) if raw_volume is not None else None}
             _cache_set(key, result, TTL_DNSE_QUOTE)
             return result
-    return None
-    client = _get_dnse_client()
-    if client is None:
-        return None
-    key = f"dnse_quote_{symbol}"
-    cached = _cache_get(key)
-    if cached is not None:
-        return cached
-    status, body = _dnse_quick_call(
-        client.get_latest_quote, symbol=symbol, board_id="G1", dry_run=False
-    )
-    if status == 200 and body:
-        raw_close = body.get("matchPrice") or body.get("closePrice") or body.get("close") or body.get("price")
-        raw_volume = body.get("matchQtty") or body.get("volume") or body.get("totalVolume")
-        close_vnd = _safe_float(raw_close)
-        if close_vnd is not None and close_vnd > 0:
-            result = {"close": round(close_vnd / 1000, 2), "volume": int(raw_volume) if raw_volume is not None else None}
+    
+    # Fallback vnstock qua endpoint /stock (có timeout)
+    try:
+        quote, err = _vnstock_quick_call(_get_vnstock_quote, symbol)
+        if err is None and quote and quote.get("close"):
+            result = {"close": quote["close"], "volume": quote.get("volume")}
             _cache_set(key, result, TTL_DNSE_QUOTE)
             return result
+        if err:
+            logger.warning(f"Fallback vnstock get_latest_quote lỗi: {err}")
+    except Exception as e:
+        logger.warning(f"Fallback vnstock get_latest_quote lỗi: {e}")
+    return None
+
+
+def _get_vnstock_quote(symbol):
+    """Lấy quote từ vnstock Market().equity().ohlcv (5 ngày gần nhất)."""
+    quote = Market().equity(symbol).ohlcv(start=_days_ago(5), end=_today(), interval="1D")
+    if quote is not None and not quote.empty:
+        latest = quote.iloc[-1]
+        close_col = _col(quote, "close", "Close") or quote.columns[-2]
+        vol_col = _col(quote, "volume", "Volume") or quote.columns[-1]
+        return {"close": float(latest[close_col]), "volume": int(latest[vol_col])}
     return None
 
 # =====================================
@@ -1341,12 +1346,13 @@ def dnse_ohlc(symbol: str, resolution: str = "1", from_ts: Optional[int] = None,
             _dnse_cache_set(key, result, TTL_DNSE_OHLC)
             return result
     
-    # Fallback vnstock (có timeout)
+    # Fallback vnstock (có timeout) - dùng 5 ngày như /stock endpoint để nhanh hơn
     try:
         interval_map = {"1": "1m", "5": "5m", "15": "15m", "60": "1H", "D": "1D"}
         vn_interval = interval_map.get(resolution, "1D")
+        # Dùng 5 ngày thay vì 30 ngày để nhanh hơn, giống /stock endpoint
         quote, err = _vnstock_quick_call(
-            Market().equity(symbol).ohlcv, start=_days_ago(30), end=_today(), interval=vn_interval
+            Market().equity(symbol).ohlcv, start=_days_ago(5), end=_today(), interval=vn_interval
         )
         if err is None and quote is not None and not quote.empty:
             result = _serialize_dnse(quote.tail(limit))
