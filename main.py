@@ -1297,6 +1297,7 @@ def _dnse_cache_set(key, data, ttl):
 
 def _serialize_dnse(obj):
     """Serialize DNSE response (dict/list) an toàn cho JSON."""
+    import pandas as pd
     if hasattr(obj, "to_dict"):
         records = obj.to_dict(orient="records")
     elif isinstance(obj, list):
