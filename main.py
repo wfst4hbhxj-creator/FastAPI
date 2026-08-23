@@ -1102,6 +1102,22 @@ def get_news(symbol: str):
         logger.error(f"/news/{symbol}: {e}")
         return _err(str(e))
 
+
+@app.get("/test/vnstock/{symbol}")
+def test_vnstock(symbol: str):
+    """Test endpoint to debug vnstock calls."""
+    symbol = symbol.upper()
+    try:
+        quote = Market().equity(symbol).ohlcv(start=_days_ago(5), end=_today(), interval="1D")
+        logger.info(f"Test vnstock: symbol={symbol}, rows={len(quote) if quote is not None else 0}, empty={quote.empty if quote is not None else True}")
+        if quote is not None and not quote.empty:
+            return {"success": True, "rows": len(quote), "sample": _serialize_dnse(quote.tail(3))}
+        return {"success": False, "error": "No data"}
+    except Exception as e:
+        logger.exception(f"Test vnstock exception: {e}")
+        return {"success": False, "error": str(e)}
+
+
 # ===== ANALYZE =====
 
 @app.get("/analyze/{symbol}")
@@ -1360,7 +1376,7 @@ def dnse_ohlc(symbol: str, resolution: str = "1", from_ts: Optional[int] = None,
     
     if cached is not None:
         return cached
-    return _err(f"Không có dữ liệu OHLC cho {symbol} (DNSE & vnstock đều fail) - check logs for details", 503)
+    return _err(f"Không có dữ liệu OHLC cho {symbol} (DNSE & vnstock đều fail). Last error logged.", 503)
 
 
 @app.get("/dnse/latest-trade/{symbol}")
