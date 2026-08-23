@@ -194,14 +194,16 @@ _VNSTOCK_QUICK_TIMEOUT = 60  # giây - timeout cho vnstock calls (vnstock chậm
 
 def _vnstock_quick_call(call_func, *args, **kwargs):
     """
-    Gọi vnstock API với timeout nhanh (8s).
-    - Timeout 8s max (vnstock chậm hơn DNSE)
+    Gọi vnstock API với timeout nhanh (60s).
+    - Timeout 60s max (vnstock chậm hơn DNSE, server Render Singapore->Vietnam chậm)
     - Không có circuit breaker (vnstock ổn định hơn)
     - Return (result) hoặc (None, error)
     """
+    logger.info(f"vnstock_quick_call: starting call_func={call_func.__name__ if hasattr(call_func, '__name__') else call_func}")
     future = _bounded_executor.submit(call_func, *args, **kwargs)
     try:
         result = future.result(timeout=_VNSTOCK_QUICK_TIMEOUT)
+        logger.info(f"vnstock_quick_call: completed successfully")
         return result, None
     except Exception as e:
         logger.warning(f"vnstock call lỗi/timeout: {e}")
