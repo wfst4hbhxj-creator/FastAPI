@@ -125,7 +125,7 @@ _DNSE_INIT_RETRY_INTERVAL = 300  # 5 phút - thử lại sau 5 phút nếu init 
 _dnse_unreachable_count = 0
 _DNSE_MAX_UNREACHABLE = 2  # sau 2 lần thất bại liên tiếp, tạm ngừng gọi DNSE
 _dnse_last_success = 0
-_DNSE_QUICK_TIMEOUT = 5  # giây - timeout nhanh cho DNSE calls
+_DNSE_QUICK_TIMEOUT = 8  # giây - timeout nhanh cho DNSE calls (tăng từ 5s)
 
 def _get_dnse_client():
     """Khởi tạo DNSEClient dạng lazy singleton. Tự retry sau interval nếu env vars được set sau."""
@@ -190,7 +190,7 @@ def _dnse_quick_call(call_func, *args, **kwargs):
             logger.warning(f"DNSE call lỗi: {e}")
         return None, str(e)
 
-_VNSTOCK_QUICK_TIMEOUT = 8  # giây - timeout cho vnstock calls (vnstock chậm hơn DNSE)
+_VNSTOCK_QUICK_TIMEOUT = 15  # giây - timeout cho vnstock calls (vnstock chậm hơn DNSE, server Render Singapore->Vietnam chậm)
 
 def _vnstock_quick_call(call_func, *args, **kwargs):
     """
