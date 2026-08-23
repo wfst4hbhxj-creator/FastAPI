@@ -1112,7 +1112,18 @@ def test_vnstock(symbol: str):
         quote = Market().equity(symbol).ohlcv(start=_days_ago(5), end=_today(), interval="1D")
         logger.info(f"Test vnstock: symbol={symbol}, rows={len(quote) if quote is not None else 0}, empty={quote.empty if quote is not None else True}")
         if quote is not None and not quote.empty:
-            return {"success": True, "rows": len(quote), "sample": _serialize_dnse(quote.tail(3))}
+            # Serialize manually to avoid _serialize_dnse issues
+            sample = quote.tail(3).to_dict(orient="records")
+            # Convert timestamps to strings
+            for row in sample:
+                for k, v in row.items():
+                    if isinstance(v, (pd.Timestamp,)):
+                        row[k] = v.strftime("%Y-%m-%d")
+                    elif isinstance(v, float) and (v != v):  # NaN
+                        row[k] = None
+                    elif hasattr(v, "item"):
+                        row[k] = v.item()
+            return {"success": True, "rows": len(quote), "sample": sample}
         return {"success": False, "error": "No data"}
     except Exception as e:
         logger.exception(f"Test vnstock exception: {e}")
