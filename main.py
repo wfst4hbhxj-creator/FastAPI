@@ -1646,9 +1646,9 @@ def dnse_instruments(
             _dnse_cache_set(key, result, TTL_DNSE_INSTRUMENTS)
             return result
     
-    # Fallback vnstock Reference().listing()
+    # Fallback vnstock Reference().equity.list()
     try:
-        listing = Reference().listing()
+        listing = Reference().equity.list()
         logger.info(f"vnstock listing fallback: rows={len(listing) if listing is not None else 0}")
         if listing is not None and not listing.empty:
             result = _serialize_dnse(listing)
