@@ -6,6 +6,7 @@ from typing import Optional, List
 import logging
 import os
 import time
+import socket
 import requests
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from datetime import date, timedelta, datetime
@@ -150,6 +151,18 @@ def _get_dnse_client():
             base_url=os.getenv("DNSE_BASE_URL", "https://openapi.dnse.com.vn"),
             api_version=os.getenv("DNSE_API_VERSION") or None,
         )
+        # Ép rút ngắn timeout nội bộ của SDK. Mặc định SDK hard-code connect=30s/read=60s
+        # (dnse/api/client.py, dòng ~33: urllib3.PoolManager(timeout=urllib3.Timeout(...))),
+        # KHÔNG có tham số constructor để override — đây là truy cập trực tiếp thuộc tính
+        # nội bộ (_http) không được SDK chính thức hỗ trợ/document.
+        # TODO: verify nếu nâng version dnse-sdk-openapi — thuộc tính _http có thể đổi tên.
+        try:
+            import urllib3
+            _dnse_client._http.connection_pool_kw['timeout'] = urllib3.Timeout(connect=3.0, read=8.0)
+            _dnse_client._http.connection_pool_kw['retries'] = urllib3.Retry(total=1, connect=1, backoff_factor=0)
+            logger.info(f"DNSE SDK timeout đã ép xuống: {_dnse_client._http.connection_pool_kw.get('timeout')}")
+        except Exception as e:
+            logger.warning(f"Không override được timeout SDK DNSE (không chặn chức năng, chỉ mất tối ưu fail-fast): {e}")
         logger.info("DNSE client khởi tạo thành công")
         return _dnse_client
     except Exception as e:
@@ -173,8 +186,9 @@ def _dnse_quick_call(call_func, *args, **kwargs):
         else:
             _dnse_unreachable_count = 0  # reset sau 5 phút
     
-    # Chạy trong thread riêng với timeout 5s
-    future = _bounded_executor.submit(call_func, *args, **kwargs)
+    # Chạy trong thread riêng với timeout 5s — dùng _dnse_executor RIÊNG (không phải
+    # _bounded_executor dùng chung với vnstock), để DNSE treo không kéo vnstock nghẽn theo.
+    future = _dnse_executor.submit(call_func, *args, **kwargs)
     try:
         status, body = future.result(timeout=_DNSE_QUICK_TIMEOUT)
         _dnse_unreachable_count = 0
@@ -345,6 +359,11 @@ FUND_HOLDINGS_FALLBACK = {
 
 # Global executor for bounded calls - reuse to avoid thread exhaustion
 _bounded_executor = ThreadPoolExecutor(max_workers=8)
+
+# Executor RIÊNG cho DNSE — tách khỏi _bounded_executor (dùng cho vnstock + các việc khác)
+# để khi DNSE treo, các luồng ngầm bị treo (Python không force-kill được thread) chỉ chiếm
+# pool riêng của DNSE (4 workers), không kéo theo vnstock fallback bị nghẽn dây chuyền.
+_dnse_executor = ThreadPoolExecutor(max_workers=4)
 
 
 def _bounded_call(fn, args=(), kwargs=None, hard_timeout=6):
@@ -1288,6 +1307,7 @@ TTL_DNSE_OHLC = 300  # 5 phút - OHLC cache lâu hơn vì DNSE hay fail
 TTL_DNSE_TRADES = 60  # 1 phút - tick data
 TTL_DNSE_LATEST_TRADE = 10  # 10 giây - giá khớp mới nhất
 TTL_DNSE_INSTRUMENTS = 3600  # 1h - danh sách mã
+TTL_DNSE_QUOTE = 20  # 20 giây - giá khớp realtime, tương đương mức đã dùng cho TTL_DNSE_LATEST_TRADE
 
 def _dnse_cache_get(key, ttl):
     """Cache với TTL riêng cho từng loại dữ liệu DNSE."""
@@ -1324,6 +1344,117 @@ def _serialize_dnse(obj):
                 new_row[k] = v
         clean.append(new_row)
     return clean
+
+@app.get("/debug/dnse-connectivity")
+def debug_dnse_connectivity():
+    """
+    Chẩn đoán kết nối DNSE THẬT từ chính server đang chạy (Render) — thay cho việc cần
+    Render Shell (gói Free không có tab Shell). Chạy 3 test ĐỘC LẬP, mỗi test tự bắt lỗi
+    riêng để 1 bước lỗi không làm hỏng 2 bước còn lại. Đo thời gian thật từng bước.
+
+    KHÔNG cache, luôn chạy live. Endpoint này CHỈ để người dùng tự gọi bằng trình duyệt/curl
+    để chẩn đoán — KHÔNG được dùng trong luồng xử lý bot bình thường.
+
+    Ngân sách thời gian tối đa dù mọi thứ đều fail: 5s (TCP) + 5s (HTTPS) + 8s (SDK) = ~18s,
+    dưới mức 20s yêu cầu — không bị treo bởi timeout 30s mặc định gốc của SDK.
+    """
+    result = {
+        "region_hint": "Server chạy tại Render (Singapore) - đây là test THẬT từ server, không phải từ máy cá nhân",
+        "tcp_connect": {"success": False, "duration_sec": None, "error": None},
+        "https_request": {"success": False, "status_code": None, "duration_sec": None, "error": None},
+        "dnse_sdk_call": {"success": False, "duration_sec": None, "error": None},
+    }
+
+    # ── Test 1: Raw TCP handshake — chỉ dùng socket chuẩn của Python, KHÔNG phụ thuộc SDK DNSE ──
+    t0 = time.time()
+    try:
+        sock = socket.create_connection(("openapi.dnse.com.vn", 443), timeout=5)
+        sock.close()
+        result["tcp_connect"]["success"] = True
+    except socket.gaierror as e:
+        result["tcp_connect"]["error"] = f"Lỗi phân giải DNS: {e}"
+    except (TimeoutError, socket.timeout) as e:
+        result["tcp_connect"]["error"] = f"Timeout kết nối TCP: {e}"
+    except ConnectionRefusedError as e:
+        result["tcp_connect"]["error"] = f"Bị từ chối kết nối: {e}"
+    except Exception as e:
+        result["tcp_connect"]["error"] = f"{type(e).__name__}: {e}"
+    finally:
+        result["tcp_connect"]["duration_sec"] = round(time.time() - t0, 2)
+
+    # ── Test 2: HTTPS request thật. verify=False vì bản thân SDK DNSE cũng tắt xác thực SSL
+    # (cert_reqs='CERT_NONE' hard-code trong dnse/api/client.py) — đây là hành vi của SDK,
+    # không phải do code bot, chỉ test theo đúng cách SDK thật sự kết nối.
+    t0 = time.time()
+    try:
+        import urllib3 as _urllib3
+        _urllib3.disable_warnings(_urllib3.exceptions.InsecureRequestWarning)
+        resp = requests.get("https://openapi.dnse.com.vn", timeout=5, verify=False)
+        result["https_request"]["success"] = True
+        result["https_request"]["status_code"] = resp.status_code
+    except requests.exceptions.SSLError as e:
+        result["https_request"]["error"] = f"Lỗi SSL: {e}"
+    except requests.exceptions.ConnectTimeout as e:
+        result["https_request"]["error"] = f"Timeout kết nối HTTPS: {e}"
+    except requests.exceptions.ConnectionError as e:
+        result["https_request"]["error"] = f"Lỗi kết nối: {e}"
+    except Exception as e:
+        result["https_request"]["error"] = f"{type(e).__name__}: {e}"
+    finally:
+        result["https_request"]["duration_sec"] = round(time.time() - t0, 2)
+
+    # ── Test 3: DNSE SDK thật — get_security_definition cho mã cố định VCB.
+    # Gọi trực tiếp qua _dnse_executor (KHÔNG qua _dnse_quick_call/circuit breaker) vì đây
+    # là 1 lần chẩn đoán độc lập, không muốn bị circuit breaker (nếu đang mở do lỗi trước
+    # đó) chặn ngang — nhưng vẫn có timeout cứng để không treo.
+    t0 = time.time()
+    try:
+        client = _get_dnse_client()
+        if client is None:
+            result["dnse_sdk_call"]["error"] = (
+                "Không khởi tạo được DNSE client (thiếu DNSE_API_KEY/SECRET, hoặc đang trong "
+                "retry-interval 5 phút sau lần init lỗi trước — xem log server để biết chi tiết)"
+            )
+        else:
+            def _call():
+                return client.get_security_definition(symbol="VCB", board_id="G1", dry_run=False)
+            future = _dnse_executor.submit(_call)
+            try:
+                status, body = future.result(timeout=8)  # khớp read timeout đã ép ở Bước 0b
+                if status == 200 and body:
+                    result["dnse_sdk_call"]["success"] = True
+                else:
+                    result["dnse_sdk_call"]["error"] = f"status={status}, body={str(body)[:300]}"
+            except FutureTimeoutError:
+                result["dnse_sdk_call"]["error"] = "Timeout sau 8s (đã ép rút ngắn ở Bước 0b)"
+    except Exception as e:
+        result["dnse_sdk_call"]["error"] = f"{type(e).__name__}: {e}"
+    finally:
+        result["dnse_sdk_call"]["duration_sec"] = round(time.time() - t0, 2)
+
+    # ── Kết luận tự động dựa trên bằng chứng — tránh người dùng phải tự đoán ──
+    tcp_ok = result["tcp_connect"]["success"]
+    https_ok = result["https_request"]["success"]
+    sdk_ok = result["dnse_sdk_call"]["success"]
+    if not tcp_ok and not https_ok and not sdk_ok:
+        result["conclusion"] = (
+            "Cả 3 test đều thất bại, kể cả raw TCP (không phụ thuộc code/SDK, chỉ dùng socket "
+            "chuẩn) — bằng chứng mạnh cho việc DNSE chặn theo IP/dải mạng của Render (Singapore), "
+            "KHÔNG phải lỗi code. Khuyến nghị: liên hệ DNSE hỗ trợ để whitelist IP của Render, "
+            "KHÔNG tiếp tục sửa code — sửa code không tự nhiên làm DNSE mở kết nối được."
+        )
+    elif tcp_ok and not sdk_ok:
+        result["conclusion"] = (
+            "TCP thông (mạng không bị chặn) nhưng SDK/HTTPS lỗi — nhiều khả năng là vấn đề "
+            "xác thực (API key/secret) hoặc lỗi tầng ứng dụng, KHÔNG phải chặn mạng. Kiểm tra "
+            "lại DNSE_API_KEY/DNSE_API_SECRET và xem chi tiết lỗi cụ thể ở trên."
+        )
+    elif sdk_ok:
+        result["conclusion"] = "Kết nối DNSE hoạt động bình thường từ server — có thể tiếp tục triển khai Bước 1-4."
+    else:
+        result["conclusion"] = "Kết quả hỗn hợp — xem chi tiết từng test ở trên để đánh giá."
+
+    return result
 
 @app.get("/dnse/secdef/{symbol}")
 def dnse_secdef(symbol: str):
@@ -1423,8 +1554,8 @@ def dnse_latest_trade(symbol: str):
     
     # Fallback vnstock - lấy giá từ /stock endpoint
     try:
-        logger.info(f"Calling _dnse_get_latest_quote for symbol={symbol}")
-        quote = _dnse_get_latest_quote(symbol)
+        logger.info(f"vnstock latest-trade fallback: symbol={symbol}, calling _get_vnstock_quote directly")
+        quote = _get_vnstock_quote(symbol)
         logger.info(f"vnstock latest-trade fallback: symbol={symbol}, quote={quote}, type={type(quote)}")
         if quote and quote.get("close"):
             result = {"matchPrice": quote["close"] * 1000, "matchQtty": quote.get("volume")}
