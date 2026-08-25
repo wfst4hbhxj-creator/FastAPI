@@ -8,6 +8,7 @@ import os
 import time
 import socket
 import requests
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from datetime import date, timedelta, datetime
 
@@ -47,6 +48,36 @@ async def add_charset_header(request, call_next):
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("vnstock-api")
+
+# =====================================
+# 🩹 VÁ vnai.beam.quota.CleanErrorContext — NGĂN vnstock GIẾT CHẾT SERVER
+# Thư viện vnstock (gói Community, giới hạn 60 req/phút) CỐ Ý gọi sys.exit() khi chạm rate
+# limit (xác nhận qua đọc trực tiếp source thật: vnai/beam/quota.py, class CleanErrorContext,
+# method __exit__, dòng ~334-335) — sys.exit() KHÔNG kế thừa Exception nên mọi
+# "except Exception" hiện có (kể cả trong _vnstock_quick_call) đều không bắt được, khiến cả
+# tiến trình FastAPI bị giết theo. Patch này giữ NGUYÊN VẸN logic cảnh báo gốc của thư viện
+# (in thông báo + cooldown 5s giữa các lần in để tránh spam log khi rate-limit dồn dập liên
+# tục), CHỈ bỏ đúng dòng sys.exit() để RateLimitExceeded trở thành exception bắt được bình
+# thường như mọi lỗi khác.
+# TODO: kiểm tra lại nếu nâng version vnai/vnstock — tên module/class/thuộc tính có thể đổi.
+try:
+    from vnai.beam.quota import CleanErrorContext, RateLimitExceeded
+
+    def _safe_clean_error_exit(self, exc_type, exc_val, exc_tb):
+        if exc_type is RateLimitExceeded:
+            current_time = time.time()
+            if current_time - CleanErrorContext._last_message_time >= CleanErrorContext._message_cooldown:
+                print(f"\n⚠️ {str(exc_val)}\n")
+                CleanErrorContext._last_message_time = current_time
+            logger.warning(f"vnstock rate limit hit (đã vá, không kill process): {exc_val}")
+            # KHÔNG gọi sys.exit() — để RateLimitExceeded tự propagate như exception bình thường
+        return False
+
+    CleanErrorContext.__exit__ = _safe_clean_error_exit
+    logger.info("Đã vá CleanErrorContext.__exit__ — vnstock rate limit không còn giết process")
+except Exception as e:
+    logger.warning(f"Không vá được CleanErrorContext (vnai đổi cấu trúc?): {e}")
+# ===================================== (hết vá CleanErrorContext) =====================================
 
 class PortfolioRequest(BaseModel):
     stocks: List[str]
@@ -206,20 +237,57 @@ def _dnse_quick_call(call_func, *args, **kwargs):
 
 _VNSTOCK_QUICK_TIMEOUT = 60  # giây - timeout cho vnstock calls (vnstock chậm hơn DNSE, server Render Singapore->Vietnam chậm)
 
+# =====================================
+# 🚦 THROTTLE CHỦ ĐỘNG — sliding-window đơn giản giữ dưới ngưỡng cứng 60 req/phút của
+# vnstock (gói Community). Chỉ cần trong 1 process (Render đang chạy 1 worker — xác nhận
+# qua log "Started server process [39]"), không cần Redis/DB ngoài.
+# Gọi _vnstock_rate_limit_ok() TRƯỚC mỗi lệnh gọi vnstock thật (Market()/Reference()/
+# Fundamental()) — nếu đã có >= 50 lượt gọi trong 60s gần nhất (chừa margin dưới ngưỡng
+# cứng 60), trả False để nơi gọi tự rơi xuống fallback (cache cũ/nguồn khác) thay vì tiếp
+# tục gọi và tự đẩy sát ngưỡng 60/60 rồi bị vnai chặn cứng (giết process nếu patch lỡ fail).
+# Lưu ý: deque không atomic tuyệt đối dưới GIL với nhiều thread, nhưng rủi ro race condition
+# ở đây chỉ khiến ngưỡng lệch nhẹ vài đơn vị — chấp nhận được vì mục đích là margin an toàn,
+# không phải giới hạn cứng chính xác tuyệt đối.
+# =====================================
+_vnstock_call_timestamps = deque()
+_VNSTOCK_RATE_LIMIT_WINDOW = 60      # giây
+_VNSTOCK_RATE_LIMIT_THRESHOLD = 50   # chừa margin dưới ngưỡng cứng 60/phút của vnai
+
+def _vnstock_rate_limit_ok():
+    """
+    True nếu được phép gọi vnstock tiếp, False nếu nên dừng (đã >= 50 lượt trong 60s gần
+    nhất). Tự dọn timestamp cũ hơn window. Gọi TRƯỚC mỗi lệnh gọi vnstock thật.
+    """
+    now = time.time()
+    while _vnstock_call_timestamps and now - _vnstock_call_timestamps[0] > _VNSTOCK_RATE_LIMIT_WINDOW:
+        _vnstock_call_timestamps.popleft()
+    if len(_vnstock_call_timestamps) >= _VNSTOCK_RATE_LIMIT_THRESHOLD:
+        return False
+    _vnstock_call_timestamps.append(now)
+    return True
+
 def _vnstock_quick_call(call_func, *args, **kwargs):
     """
     Gọi vnstock API với timeout nhanh (60s).
     - Timeout 60s max (vnstock chậm hơn DNSE, server Render Singapore->Vietnam chậm)
     - Không có circuit breaker (vnstock ổn định hơn)
+    - Throttle chủ động: chặn TRƯỚC khi gọi nếu đã gần chạm ngưỡng 60/phút (xem
+      _vnstock_rate_limit_ok ở trên)
     - Return (result) hoặc (None, error)
     """
+    if not _vnstock_rate_limit_ok():
+        logger.warning(f"vnstock throttle chủ động: đã >= {_VNSTOCK_RATE_LIMIT_THRESHOLD} lượt gọi trong {_VNSTOCK_RATE_LIMIT_WINDOW}s gần nhất — chặn trước khi chạm ngưỡng cứng 60/phút")
+        return None, "Đang xử lý nhiều yêu cầu, thử lại sau ít giây"
     logger.info(f"vnstock_quick_call: starting call_func={call_func.__name__ if hasattr(call_func, '__name__') else call_func}, args={args}, kwargs={kwargs}")
     future = _bounded_executor.submit(call_func, *args, **kwargs)
     try:
         result = future.result(timeout=_VNSTOCK_QUICK_TIMEOUT)
         logger.info(f"vnstock_quick_call: completed successfully, result type={type(result)}")
         return result, None
-    except Exception as e:
+    except (Exception, SystemExit) as e:
+        # Bắt cả SystemExit — lớp phòng thủ 2, phòng khi patch CleanErrorContext (đầu file)
+        # vì lý do gì đó không áp dụng được (VD vnai đổi cấu trúc ở bản sau). Đây là "cửa
+        # ngõ" chính của MỌI lệnh gọi vnstock qua _bounded_executor — quan trọng nhất cần vá.
         logger.exception(f"vnstock call lỗi/timeout: {e}")
         return None, str(e)
 
@@ -379,7 +447,11 @@ def _bounded_call(fn, args=(), kwargs=None, hard_timeout=6):
     except FutureTimeoutError:
         logger.warning(f"_bounded_call: {getattr(fn, '__name__', fn)} vượt timeout cứng {hard_timeout}s")
         return None
-    except Exception as e:
+    except (Exception, SystemExit) as e:
+        # Bắt cả SystemExit — lớp phòng thủ 2 phòng khi patch CleanErrorContext (ở đầu file)
+        # vì lý do gì đó không áp dụng được (VD vnai đổi cấu trúc ở bản sau). _bounded_call
+        # được dùng cho vnstock (fund holdings fallback, /fund-favorites, _bounded_vnstock_call)
+        # — KHÔNG dùng cho DNSE (DNSE có _dnse_quick_call + _dnse_executor riêng, không đụng).
         logger.warning(f"_bounded_call: {getattr(fn, '__name__', fn)} lỗi: {e}")
         return None
 
@@ -439,9 +511,13 @@ def _fetch_fund_holdings(fund_name):
 
     # ── Lớp 1: vnstock, timeout cứng 6s/nguồn, KHÔNG retry/sleep ──
     def _via_reference():
+        if not _vnstock_rate_limit_ok():
+            raise RuntimeError("vnstock throttle chủ động — đã gần chạm ngưỡng 60/phút")
         return _serialize(Reference().fund(fund_name).top_holding())
 
     def _via_market():
+        if not _vnstock_rate_limit_ok():
+            raise RuntimeError("vnstock throttle chủ động — đã gần chạm ngưỡng 60/phút")
         return _serialize(Market().fund(fund_name).top_holding())
 
     result = _bounded_call(_via_reference, hard_timeout=6)
@@ -505,7 +581,11 @@ def _bounded_call_diag(fn, args=(), kwargs=None, hard_timeout=6):
         return future.result(timeout=hard_timeout), None
     except FutureTimeoutError:
         return None, f"Timeout sau {hard_timeout}s"
-    except Exception as e:
+    except (Exception, SystemExit) as e:
+        # Bắt cả SystemExit — lớp phòng thủ 2 (giống _bounded_call/_vnstock_quick_call ở trên).
+        # Hàm này gọi trực tiếp Reference()/Market() (qua _via_reference/_via_market) nên có
+        # cùng rủi ro bị vnai giết process khi chạm rate limit nếu patch CleanErrorContext lỡ
+        # không áp dụng được.
         return None, str(e)
     finally:
         executor.shutdown(wait=False)
@@ -523,10 +603,14 @@ def _diagnose_fund_holdings(fund_name):
     err_ref = err_mkt = None
     try:
         def _via_reference():
+            if not _vnstock_rate_limit_ok():
+                raise RuntimeError("vnstock throttle chủ động — đã gần chạm ngưỡng 60/phút")
             return _serialize(Reference().fund(fund_name).top_holding())
         r, err_ref = _bounded_call_diag(_via_reference, hard_timeout=6)
         if not r:
             def _via_market():
+                if not _vnstock_rate_limit_ok():
+                    raise RuntimeError("vnstock throttle chủ động — đã gần chạm ngưỡng 60/phút")
                 return _serialize(Market().fund(fund_name).top_holding())
             r, err_mkt = _bounded_call_diag(_via_market, hard_timeout=6)
         layer1_result = r
@@ -1646,9 +1730,9 @@ def dnse_instruments(
             _dnse_cache_set(key, result, TTL_DNSE_INSTRUMENTS)
             return result
     
-    # Fallback vnstock Reference().equity.list()
+    # Fallback vnstock Reference().listing()
     try:
-        listing = Reference().equity.list()
+        listing = Reference().listing()
         logger.info(f"vnstock listing fallback: rows={len(listing) if listing is not None else 0}")
         if listing is not None and not listing.empty:
             result = _serialize_dnse(listing)
