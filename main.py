@@ -469,24 +469,29 @@ def _fetch_funds_sequential(fund_names):
     for fn in fund_names:
         try:
             results[fn] = _fetch_fund_holdings(fn) or []
-        except Exception as e:
+        except (Exception, SystemExit) as e:
+            # Bắt cả SystemExit — lớp phòng thủ 2 nhất quán với _bounded_call/_vnstock_quick_call
+            # (phòng khi patch CleanErrorContext ở đầu file vì lý do gì đó không áp dụng được).
             logger.warning(f"_fetch_funds_sequential: quỹ {fn} lỗi: {e}")
             results[fn] = []
     return results
 
 def _map_sequential(items, fn, timeout_per_item=15):
     """
-    Chạy fn(item) cho từng item TUẦN TỰ — dùng cho các endpoint gọi vnstock
-    để tránh crash do thread-safety của vnstock. Giữ timeout logic giống _map_parallel.
+    Chạy fn(item) cho từng item TUẦN TỰ (chờ item này xong mới sang item kế) — giữ đúng
+    tính chất "vnstock not thread-safe" vì tại mọi thời điểm chỉ có tối đa 1 lệnh gọi vnstock
+    đang chạy. timeout_per_item được ÁP DỤNG THẬT qua _bounded_call (ThreadPoolExecutor +
+    shutdown(wait=False), không dùng "with") — TRƯỚC ĐÂY tham số này bị NHẬN VÀO NHƯNG KHÔNG
+    BAO GIỜ ĐƯỢC DÙNG (bug thật đã xác nhận bằng đọc code + test), khiến 1 item treo có thể
+    làm cả endpoint treo vô thời hạn, không có giới hạn nào.
     """
     items = list(items)
     results = {}
     for item in items:
         try:
-            # Gọi trực tiếp, không dùng thread pool
-            results[item] = fn(item)
-        except Exception as e:
-            logger.warning(f"_map_sequential: item {item} lỗi: {e}")
+            results[item] = _bounded_call(fn, args=(item,), hard_timeout=timeout_per_item)
+        except (Exception, SystemExit) as e:
+            logger.exception(f"_map_sequential: item {item} lỗi: {e}")
             results[item] = None
     return results
 
@@ -759,6 +764,15 @@ def get_dividend(symbol: str):
     cached = _cache_get(key)
     if cached is not None:
         return cached
+
+    # Ghi lại lỗi kỹ thuật thật (nếu có) để phân biệt "lỗi mạng/API" (503, nên thử lại) với
+    # "symbol thực sự không có dữ liệu cổ tức" (404) — TRƯỚC ĐÂY cả 2 except đều "pass" câm
+    # lặng, không log gì, khiến không thể biết 404 là do đâu (đã xác nhận bằng cách gọi thật:
+    # Reference().company().events() và Fundamental().equity().ratio() ĐỀU tồn tại đúng tên
+    # trong vnstock==4.0.7 — không phải "API đổi tên"; khi test trong sandbox, lỗi thật là
+    # ConnectionError/RetryError từ nguồn dữ liệu, tức lỗi tầng mạng chứ không phải code sai).
+    network_error = None
+
     try:
         company_ref = Reference().company(symbol)
         events = company_ref.events()
@@ -772,19 +786,28 @@ def get_dividend(symbol: str):
                 result = _serialize(divs)
                 _cache_set(key, result, TTL_COMPANY)
                 return result
-    except Exception:
-        pass
+    except (Exception, SystemExit) as e:
+        logger.exception(f"/dividend/{symbol} — Reference().company().events() lỗi")
+        network_error = e
+
     try:
         ratio = Fundamental().equity(symbol).ratio()
         if ratio is not None and not ratio.empty:
+            # Cột chuẩn hóa "dividend_yield" — xác nhận qua đọc trực tiếp source thật
+            # vnstock/explorer/vci/const.py: API gốc trả "dividendYield", vnstock tự map về
+            # "dividend_yield" (snake_case). Filter theo "div" hiện có vẫn khớp đúng cột này.
             div_cols = [c for c in ratio.columns if "dividend" in str(c).lower() or "div" in str(c).lower()]
             if div_cols:
                 all_cols = ([c for c in ["period"] if c in ratio.columns]) + div_cols
                 result = _serialize(ratio[all_cols].head(8))
                 _cache_set(key, result, TTL_COMPANY)
                 return result
-    except Exception:
-        pass
+    except (Exception, SystemExit) as e:
+        logger.exception(f"/dividend/{symbol} — Fundamental().equity().ratio() lỗi")
+        network_error = e
+
+    if network_error is not None:
+        return _err(f"Tạm thời không lấy được dữ liệu cổ tức cho {symbol} (lỗi kỹ thuật, xem log server để biết chi tiết): {network_error}", 503)
     return _err(f"Không có dữ liệu cổ tức cho {symbol}", 404)
 
 
@@ -1296,7 +1319,7 @@ def get_growth_stocks():
     candidates = []
     seen = set()
     holdings_map = _fetch_funds_sequential(["DCDS", "DCDE", "DCBF"])
-    
+
     # Collect unique symbols first
     symbols = []
     for fund_name in ["DCDS", "DCDE", "DCBF"]:
@@ -1309,16 +1332,37 @@ def get_growth_stocks():
                     symbols.append(sym)
         except Exception:
             pass
-    
+
+    total_unique = len(symbols)
+    logger.info(f"/growth-stocks — bước 1: {total_unique} mã unique từ 3 quỹ DCDS/DCDE/DCBF: {symbols}")
+
     if not symbols:
-        return {"count": 0, "stocks": []}
-    
-    # Giới hạn số lượng symbols để tránh timeout Render (30s)
-    symbols = symbols[:5]
-    
-    # Sequential fetch financial summary (vnstock not thread-safe)
-    fin_map = _map_sequential(symbols, get_financial_summary, timeout_per_item=10)
-    
+        return {"count": 0, "stocks": [], "debug_funnel": {"unique_symbols_from_funds": 0}}
+
+    # Giới hạn số lượng symbols xét — ĐÃ TĂNG từ 5 lên 12 (quyết định ngày hôm nay, chọn
+    # phương án (a) thay vì (b) phân trang):
+    #   - Lý do chọn (a): worst-case 12×3s=36s vẫn an toàn dưới trần thực tế ~60s của GAS
+    #     UrlFetchApp; phương án (b) (phân trang qua nhiều round-trip) bị loại vì rủi ro cộng
+    #     dồn thời gian qua nhiều lần gọi VÀ dễ đụng rate-limit 50/phút (throttle vá lỗi
+    #     sys.exit() ở lần trước) khi CK.gs phải gọi liên tiếp nhiều trang trong thời gian ngắn.
+    #   - timeout_per_item giảm từ 10s -> 3s để 12 mã × 3s = 36s (thay vì 12×10s=120s nếu giữ
+    #     nguyên timeout cũ — sẽ vượt xa giới hạn Render/GAS).
+    #   - Vẫn KHÔNG loại bỏ hoàn toàn nguy cơ bug cũ (mã tốt nằm ngoài top 12 theo thứ tự
+    #     DCDS->DCDE->DCBF vẫn có thể bị bỏ sót nếu tổng unique > 12) — chỉ giảm đáng kể xác
+    #     suất so với giới hạn 5 trước đây. "debug_funnel" bên dưới vẫn giữ để theo dõi việc
+    #     này về sau nếu cần điều chỉnh tiếp.
+    symbols = symbols[:12]
+    logger.info(f"/growth-stocks — bước 2: giới hạn còn {len(symbols)}/{total_unique} mã (symbols[:12]): {symbols}")
+
+    # Sequential fetch financial summary (vnstock not thread-safe) — timeout_per_item=3s
+    # (giảm từ 10s) để tổng worst-case 12×3s=36s, an toàn dưới trần ~60s của GAS UrlFetchApp.
+    fin_map = _map_sequential(symbols, get_financial_summary, timeout_per_item=3)
+    valid_fin_count = sum(
+        1 for sym in symbols
+        if isinstance(fin_map.get(sym), dict) and fin_map.get(sym).get("periods", 0) > 0
+    )
+    logger.info(f"/growth-stocks — bước 3: {valid_fin_count}/{len(symbols)} mã có financial_summary hợp lệ (periods>0)")
+
     for sym in symbols:
         try:
             fin = fin_map.get(sym)
@@ -1332,56 +1376,110 @@ def get_growth_stocks():
                                    "pe": l.get("pe"), "pb": l.get("pb")})
         except Exception:
             pass
-    
+
+    logger.info(f"/growth-stocks — bước 4 (cuối): {len(candidates)}/{valid_fin_count} mã đạt ngưỡng ROE>=15% và EPS>0")
+
     result = sorted(candidates, key=lambda x: x.get("roe", 0), reverse=True)
-    return {"count": len(result), "stocks": result[:20]}
+    return {
+        "count": len(result),
+        "stocks": result[:20],
+        "debug_funnel": {
+            "unique_symbols_from_funds": total_unique,
+            "symbols_after_limit_12": len(symbols),
+            "symbols_with_valid_financial_data": valid_fin_count,
+            "symbols_passing_roe15_eps_filter": len(candidates),
+            "note": (
+                "Nếu unique_symbols_from_funds > 12, một số mã vẫn có thể bị BỎ QUA do giới "
+                "hạn symbols[:12] (đã tăng từ 5 lên 12 — xem comment ở bước 2 để biết lý do "
+                "chọn 12 thay vì phân trang). KHÔNG PHẢI do ngưỡng ROE>=15%/EPS>0 quá chặt "
+                "(15% ROE là mức phổ biến, không đặc biệt cao)."
+            ),
+        },
+    }
 
 # ===== DIVIDEND KINGS =====
 
 @app.get("/dividend-kings")
 def get_dividend_kings():
-    candidates = []
-    seen = set()
-    holdings_map = _fetch_funds_sequential(["DCDS", "DCDE", "DCBF"])
-    
-    # Collect unique symbols first
-    symbols = []
-    for fund_name in ["DCDS", "DCDE", "DCBF"]:
-        try:
-            holdings = holdings_map.get(fund_name) or []
-            for row in holdings:
-                sym = str(row.get("stock_code") or row.get("symbol") or "").upper()
-                if sym and sym not in seen:
-                    seen.add(sym)
-                    symbols.append(sym)
-        except Exception:
-            pass
-    
-    if not symbols:
-        return {"count": 0, "stocks": []}
-    
-    # Giới hạn số lượng symbols để tránh timeout Render (30s)
-    symbols = symbols[:5]
-    
-    # Sequential fetch dividend and score data (vnstock not thread-safe)
-    div_map = _map_sequential(symbols, get_dividend, timeout_per_item=10)
-    score_map = _map_sequential(symbols, get_score, timeout_per_item=10)
-    
-    for sym in symbols:
-        try:
-            div = div_map.get(sym)
-            if not isinstance(div, list) or len(div) == 0:
-                continue
-            sc = score_map.get(sym)
-            score_val = sc.get("score", 0) if isinstance(sc, dict) else 0
-            candidates.append({"symbol": sym, "dividend_count": len(div),
-                               "score": score_val,
-                               "rating": sc.get("rating") if isinstance(sc, dict) else None})
-        except Exception:
-            pass
-    
-    result = sorted(candidates, key=lambda x: (x.get("dividend_count", 0), x.get("score", 0)), reverse=True)
-    return {"count": len(result), "stocks": result[:20]}
+    try:
+        candidates = []
+        seen = set()
+        holdings_map = _fetch_funds_sequential(["DCDS", "DCDE", "DCBF"])
+
+        # Collect unique symbols first
+        symbols = []
+        for fund_name in ["DCDS", "DCDE", "DCBF"]:
+            try:
+                holdings = holdings_map.get(fund_name) or []
+                for row in holdings:
+                    sym = str(row.get("stock_code") or row.get("symbol") or "").upper()
+                    if sym and sym not in seen:
+                        seen.add(sym)
+                        symbols.append(sym)
+            except Exception:
+                pass
+
+        total_unique = len(symbols)
+        logger.info(f"/dividend-kings — bước 1: {total_unique} mã unique từ 3 quỹ DCDS/DCDE/DCBF: {symbols}")
+
+        if not symbols:
+            return {"count": 0, "stocks": [], "debug_funnel": {"unique_symbols_from_funds": 0}}
+
+        # Giới hạn số lượng symbols để tránh timeout Render (30s) — cùng nghi vấn như
+        # /growth-stocks (xem ghi chú chi tiết ở đó): có thể bỏ sót mã đạt tiêu chí nếu nó
+        # không nằm trong 5 mã đầu tiên theo thứ tự DCDS->DCDE->DCBF.
+        symbols = symbols[:5]
+        logger.info(f"/dividend-kings — bước 2: giới hạn còn {len(symbols)}/{total_unique} mã (symbols[:5]): {symbols}")
+
+        # Sequential fetch dividend and score data (vnstock not thread-safe)
+        div_map = _map_sequential(symbols, get_dividend, timeout_per_item=10)
+        score_map = _map_sequential(symbols, get_score, timeout_per_item=10)
+        valid_div_count = sum(
+            1 for sym in symbols if isinstance(div_map.get(sym), list) and len(div_map.get(sym)) > 0
+        )
+        logger.info(f"/dividend-kings — bước 3: {valid_div_count}/{len(symbols)} mã có dữ liệu cổ tức hợp lệ")
+
+        for sym in symbols:
+            try:
+                div = div_map.get(sym)
+                if not isinstance(div, list) or len(div) == 0:
+                    continue
+                sc = score_map.get(sym)
+                # score_val luôn là số theo thiết kế get_score() (đã xác nhận đọc code: luôn
+                # khởi tạo total_score=0 rồi cộng dồn, không bao giờ trả None) — nhưng vẫn
+                # thêm "or 0" làm lớp phòng thủ, tránh sorted() lỗi TypeError nếu logic
+                # get_score() đổi ở tương lai và vô tình trả None (đã tự test xác nhận
+                # TypeError thật sự xảy ra nếu score trộn lẫn None và int khi so sánh).
+                score_val = (sc.get("score", 0) if isinstance(sc, dict) else 0) or 0
+                candidates.append({"symbol": sym, "dividend_count": len(div),
+                                   "score": score_val,
+                                   "rating": sc.get("rating") if isinstance(sc, dict) else None})
+            except Exception:
+                pass
+
+        logger.info(f"/dividend-kings — bước 4 (cuối): {len(candidates)}/{valid_div_count} mã lọt vào danh sách cuối")
+
+        result = sorted(candidates, key=lambda x: (x.get("dividend_count", 0), x.get("score") or 0), reverse=True)
+        return {
+            "count": len(result),
+            "stocks": result[:20],
+            "debug_funnel": {
+                "unique_symbols_from_funds": total_unique,
+                "symbols_after_limit_5": len(symbols),
+                "symbols_with_dividend_data": valid_div_count,
+                "symbols_in_final_result": len(candidates),
+                "note": (
+                    "Nếu unique_symbols_from_funds > 5, một số mã bị BỎ QUA hoàn toàn do giới "
+                    "hạn symbols[:5]."
+                ),
+            },
+        }
+    except Exception as e:
+        # Bọc toàn bộ hàm — nếu lỗi 500 tái diễn, traceback ĐẦY ĐỦ sẽ nằm trong log server
+        # (thay vì generic 500 không rõ nguyên nhân như trước) — có bằng chứng thật ngay cho
+        # lần điều tra tiếp theo thay vì phải đoán lại từ đầu.
+        logger.exception(f"/dividend-kings — lỗi không lường trước")
+        return _err(f"Lỗi khi tổng hợp dividend-kings (đã ghi traceback đầy đủ vào log server): {e}", 500)
 
 
 # ===== DNSE MARKET DATA API =====
@@ -1392,6 +1490,11 @@ TTL_DNSE_TRADES = 60  # 1 phút - tick data
 TTL_DNSE_LATEST_TRADE = 10  # 10 giây - giá khớp mới nhất
 TTL_DNSE_INSTRUMENTS = 3600  # 1h - danh sách mã
 TTL_DNSE_QUOTE = 20  # 20 giây - giá khớp realtime, tương đương mức đã dùng cho TTL_DNSE_LATEST_TRADE
+
+# Lô chẵn (bội số khối lượng đặt lệnh) — quy định thống nhất HOSE/HNX/UPCOM = 100 cổ phiếu
+# (từ khi quy định lô chẵn được đồng bộ giữa các sàn). Đây là hằng số theo quy định nhà nước,
+# KHÔNG cần gọi API nào để lấy — không nhầm với lô lớn (block trade) hay lô lẻ (odd lot).
+DEFAULT_LOT_SIZE = 100
 
 def _dnse_cache_get(key, ttl):
     """Cache với TTL riêng cho từng loại dữ liệu DNSE."""
@@ -1549,20 +1652,47 @@ def dnse_secdef(symbol: str):
     if cached is not None:
         return cached
     client = _get_dnse_client()
-    if client is None:
-        return _err("DNSE client chưa cấu hình (thiếu DNSE_API_KEY/SECRET)", 503)
-    status, body = _dnse_quick_call(
-        client.get_security_definition, symbol=symbol, board_id="G1", dry_run=False
-    )
-    if status == 200 and body:
-        result = _serialize_dnse(body)
+    if client is not None:
+        status, body = _dnse_quick_call(
+            client.get_security_definition, symbol=symbol, board_id="G1", dry_run=False
+        )
+        if status == 200 and body:
+            result = _serialize_dnse(body)
+            _dnse_cache_set(key, result, TTL_DNSE_SECDEF)
+            return result
+
+    # ── Fallback vnstock cho ceiling/floor khi DNSE fail (circuit breaker/timeout) ──
+    # Xác nhận qua đọc trực tiếp source thật vnstock==4.0.7: vnstock/explorer/vci/const.py,
+    # dòng 165-166, _PRICE_INFO_MAP map "ceiling_price"->"ceiling", "floor_price"->"floor".
+    # Timeout cứng 8s qua _bounded_call (ThreadPoolExecutor + shutdown(wait=False), KHÔNG
+    # dùng "with"), bắt cả SystemExit bên trong _bounded_call (đã học từ lần vá rate-limit).
+    def _via_vnstock_price_board():
+        if not _vnstock_rate_limit_ok():
+            raise RuntimeError("vnstock throttle chủ động — đã gần chạm ngưỡng 60/phút")
+        from vnstock import Trading
+        df = Trading(source="VCI").price_board([symbol])
+        return _serialize(df)
+
+    fallback_rows = _bounded_call(_via_vnstock_price_board, hard_timeout=8)
+    if fallback_rows and len(fallback_rows) > 0:
+        row = fallback_rows[0]
+        result = {
+            "symbol": symbol,
+            "ceiling": row.get("ceiling"),
+            "floor": row.get("floor"),
+            "ref_price": row.get("ref_price"),
+            # Lot size = 100: quy định lô chẵn thống nhất HOSE/HNX/UPCOM (từ khi đồng bộ quy
+            # định lô chẵn), là hằng số theo quy định nhà nước — KHÔNG cần gọi API nào để lấy.
+            "lot_size": DEFAULT_LOT_SIZE,
+            "source": "vnstock_fallback",
+        }
         _dnse_cache_set(key, result, TTL_DNSE_SECDEF)
         return result
-    if status == "circuit_open":
-        return _err("DNSE tạm thời không khả dụng (circuit breaker), thử lại sau", 503)
+    logger.warning(f"/dnse/secdef/{symbol} — DNSE fail, vnstock fallback (Trading.price_board) cũng không có dữ liệu")
+
     if cached is not None:
         return cached
-    return _err(f"DNSE không khả dụng, không có cache cho {symbol} - check logs", 503)
+    return _err(f"DNSE và vnstock fallback đều không khả dụng cho {symbol} — check logs", 503)
 
 
 @app.get("/dnse/ohlc/{symbol}")
@@ -1688,10 +1818,19 @@ def dnse_trades(symbol: str, board_id: str = "G1", from_date: Optional[str] = No
             _dnse_cache_set(key, result, TTL_DNSE_TRADES)
             return result
     
-    # Fallback: không có tick data từ vnstock, trả cache nếu có
+    # Không có tick data từ vnstock — xác nhận thật: tick-level data (time & sales) chỉ có ở
+    # API môi giới trả phí, vnstock (Community) KHÔNG có tương đương, KHÔNG bịa dữ liệu giả.
+    # Trả HTTP 200 (không phải 503) với body rõ ràng để CK.gs không coi đây là lỗi hệ thống —
+    # có thể hiển thị thông báo phù hợp cho người dùng thay vì generic "lỗi server".
     if cached is not None:
         return cached
-    return _err(f"Không có tick data cho {symbol} (DNSE unreachable, vnstock không có tick data) - check logs", 503)
+    return {
+        "symbol": symbol,
+        "available": False,
+        "reason": "Tick data yêu cầu DNSE, hiện chặn IP ngoài VN",
+        "alternative": "Dùng /dnse/ohlc/{symbol}?resolution=1 (nến 1 phút) làm xấp xỉ gần nhất",
+        "source": None,
+    }
 
 
 @app.get("/dnse/instruments")
